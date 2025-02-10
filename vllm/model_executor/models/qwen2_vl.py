@@ -66,6 +66,7 @@ from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
 from vllm.platforms import _Backend
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import uses_mrope
+from vllm.utils import is_pin_memory_available
 
 from .interfaces import SupportsLoRA, SupportsMultiModal, SupportsPP
 from .utils import (AutoWeightsLoader, WeightsMapper,
@@ -299,6 +300,7 @@ class Qwen2VisionAttention(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         rotary_pos_emb: torch.Tensor,
+        max_seqlen: int,
     ) -> torch.Tensor:
 
         # [s, b, c] --> [s, b, 3 * head * head_dim]
@@ -321,7 +323,6 @@ class Qwen2VisionAttention(nn.Module):
 
             q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
 
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
             output = flash_attn_varlen_func(q,
                                             k,
                                             v,
@@ -398,10 +399,11 @@ class Qwen2VisionBlock(nn.Module):
                                   prefix=f"{prefix}.mlp")
 
     def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor,
-                rotary_pos_emb: torch.Tensor) -> torch.Tensor:
+                rotary_pos_emb: torch.Tensor, max_seqlen: int) -> torch.Tensor:
         x = x + self.attn(self.norm1(x),
                           cu_seqlens=cu_seqlens,
-                          rotary_pos_emb=rotary_pos_emb)
+                          rotary_pos_emb=rotary_pos_emb,
+                          max_seqlen=max_seqlen)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -507,6 +509,7 @@ class Qwen2VisionRotaryEmbedding(nn.Module):
 
 
 class Qwen2VisionTransformer(nn.Module):
+    _is_vit_capturing = False
 
     def __init__(
         self,
@@ -566,8 +569,8 @@ class Qwen2VisionTransformer(nn.Module):
     @property
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
-
-    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+    
+    def _compute_rot_pos_ids(self, grid_thw: torch.Tensor) -> torch.Tensor:    
         pos_ids = []
         for t, h, w in grid_thw:
             hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
@@ -586,39 +589,90 @@ class Qwen2VisionTransformer(nn.Module):
             ).permute(0, 2, 1, 3).flatten()
             pos_ids.append(
                 torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
-        pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
-        return rotary_pos_emb
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        grid_thw: torch.Tensor,
-    ) -> torch.Tensor:
-        # patchify
-        x = x.to(device=self.device, dtype=self.dtype)
-        x = self.patch_embed(x)
-
-        # compute position embedding
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-
-        # compute cu_seqlens
+        out_pos_ids = torch.empty(
+            (grid_thw.prod(dim=1).sum(), 2),
+            dtype=torch.int64,
+            pin_memory=is_pin_memory_available(),
+        )
+        torch.cat(pos_ids, dim=0, out=out_pos_ids)
+        return out_pos_ids
+    
+    def _compute_cu_seqlens(self, grid_thw: torch.Tensor) -> torch.Tensor:
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
                                              grid_thw[:, 0]).cumsum(
                                                  dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        return cu_seqlens, max_seqlen
+    
+    def _vit_forward(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        rotary_pos_emb_full: torch.Tensor,
+        pos_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+        
+        # patchify
+        x = self.patch_embed(x)
 
         # transformers
         x = x.unsqueeze(1)
         for blk in self.blocks:
-            x = blk(x, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
+            x = blk(x, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb, max_seqlen=max_seqlen)
 
         # adapter
         x = self.merger(x)
 
         return x
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        grid_thw = grid_thw.cpu()
+
+        x = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
+
+        cu_seqlens, max_seqlen = self._compute_cu_seqlens(grid_thw)
+        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+
+        pos_ids = self._compute_rot_pos_ids(grid_thw).to(self.device, non_blocking=True)
+
+        max_grid_size = grid_thw[:, 1:].max()
+        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+
+        if self._is_vit_capturing:
+            torch._dynamo.mark_static(x, 1)
+            torch._dynamo.mark_static(cu_seqlens, 1)
+            torch._dynamo.mark_static(rotary_pos_emb_full, 1)
+            torch._dynamo.mark_static(pos_ids, 1)
+
+        return self._vit_forward(x, cu_seqlens, max_seqlen, rotary_pos_emb_full, pos_ids)
+    
+    @torch.inference_mode
+    def compile_and_capture(self):
+        self._vit_forward = torch.compile(self._vit_forward, dynamic=True)
+
+        self._is_vit_capturing = True
+        capture_grid_thws = [
+            [
+                [1, 4, 4],
+            ],
+        ]
+        for grid_thw in capture_grid_thws:
+            num_features = 0
+            for t, h, w in grid_thw:
+                num_features += t * h * w
+
+            pixel_values = torch.rand((num_features, 1176), dtype=self.dtype, device=self.device)
+            grid_thw = torch.tensor(grid_thw, dtype=torch.int64)
+
+            self.forward(pixel_values, grid_thw)
+        self._is_vit_capturing = False
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
@@ -1389,3 +1443,6 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
             language_model="language_model",
             connector="visual.",
             tower_model="visual.merger.")
+
+    def compile_vit(self):
+        self.visual.compile_and_capture()
