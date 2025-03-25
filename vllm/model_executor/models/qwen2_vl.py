@@ -67,6 +67,7 @@ from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         BaseProcessingInfo, PromptReplacement,
                                         PromptUpdate)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
+from vllm.numba_utils import numba_replicate_exponential
 from vllm.platforms import _Backend
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import uses_mrope
@@ -646,35 +647,41 @@ class Qwen2VisionTransformer(nn.Module):
             l += grid_thw[i, 0] * grid_thw[i, 1] * grid_thw[i, 2]
         
         arr = np.empty((l, 2), dtype=np.int64)
+        arr_ptr = arr.ctypes
+        
         pos = 0
-        if spatial_merge_size == 2:
-            # further optimized for spatial_merge_size == 2
-            for i in range(len(grid_thw)):
-                for _ in range(grid_thw[i, 0]):
-                    for h in range(0, grid_thw[i, 1], 2):
-                        for w in range(0, grid_thw[i, 2], 2):
-                            arr[pos, 0] = h
-                            arr[pos, 1] = w
-                            pos += 1
-                            arr[pos, 0] = h
-                            arr[pos, 1] = w + 1
-                            pos += 1
-                            arr[pos, 0] = h + 1
-                            arr[pos, 1] = w
-                            pos += 1
-                            arr[pos, 0] = h + 1
-                            arr[pos, 1] = w + 1
-                            pos += 1
-        else:
-            for i in range(len(grid_thw)):
-                for _ in range(grid_thw[i, 0]):
-                    for h in range(0, grid_thw[i, 1], spatial_merge_size):
-                        for w in range(0, grid_thw[i, 2], spatial_merge_size):
-                            for m_x in range(spatial_merge_size):
-                                for m_y in range(spatial_merge_size):
-                                    arr[pos, 0] = h + m_x
-                                    arr[pos, 1] = w + m_y
-                                    pos += 1
+        for i in range(len(grid_thw)):
+            num_t = grid_thw[i, 0].item()
+            num_h = grid_thw[i, 1].item()
+            num_w = grid_thw[i, 2].item()
+            hw = num_h * num_w
+            
+            if spatial_merge_size == 2:
+                # further optimized for spatial_merge_size == 2 by unroll
+                for h in range(0, num_h, 2):
+                    for w in range(0, num_w, 2):
+                        arr[pos, 0] = h
+                        arr[pos, 1] = w
+                        arr[pos + 1, 0] = h
+                        arr[pos + 1, 1] = w + 1
+                        arr[pos + 2, 0] = h + 1
+                        arr[pos + 2, 1] = w
+                        arr[pos + 3, 0] = h + 1
+                        arr[pos + 3, 1] = w + 1
+                        pos += 4
+            else:
+                for h in range(0, num_h, spatial_merge_size):
+                    for w in range(0, num_w, spatial_merge_size):
+                        for m_x in range(spatial_merge_size):
+                            for m_y in range(spatial_merge_size):
+                                arr[pos, 0] = h + m_x
+                                arr[pos, 1] = w + m_y
+                                pos += 1
+            
+            if num_t > 1:
+                numba_replicate_exponential(arr_ptr, pos * 2, hw * 2, num_t - 1)
+                pos += hw * (num_t - 1)
+        
         return arr
     
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
