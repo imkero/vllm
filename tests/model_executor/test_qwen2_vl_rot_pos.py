@@ -29,7 +29,6 @@ def test_qwen2_vl_rot_pos_correctness(dist_init, spatial_merge_size):
         for h in range(1, 100):
             for w in range(1, 100):
                 grid_thw = torch.tensor([[t, h * spatial_merge_size, w * spatial_merge_size]], dtype=torch.int64)
-                print(grid_thw)
                 rot_pos_torch = vit.compute_rot_pos_torch(grid_thw)
                 rot_pos_numba = vit.compute_rot_pos_numba(grid_thw.numpy(), spatial_merge_size)
                 rot_pos_numba = torch.from_numpy(rot_pos_numba)
