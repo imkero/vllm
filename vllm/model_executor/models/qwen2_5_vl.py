@@ -687,12 +687,17 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
     @staticmethod
     @jit(nopython=True)
-    def get_window_index_numba(
+    def get_window_index_and_seqlens_numba(
         grid_thw: np.ndarray,
         window_size: int,
         spatial_merge_size: int,
         patch_size: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[
+        np.ndarray, # indices (window_indices and reverse_indices)
+        np.ndarray, # full_seqlens
+        np.ndarray, # window_seqlens
+        np.ndarray, # cu_seqlens (cu_full_seqlens and cu_window_seqlens)
+    ]:
         """
         numba optimized version of get_window_index_torch
 
@@ -707,6 +712,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
         total_cell_count = 0
         total_window_count = 0
+        total_temporal = 0
 
         # first pass: compute total sizes
         for i in range(grid_thw.shape[0]):
@@ -722,16 +728,31 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
             total_window_count += temporal * num_blocks_height * num_blocks_width
 
-        window_indices = np.empty(total_cell_count, dtype=np.int64)
-        reverse_indices = np.empty(total_cell_count, dtype=np.int64)
+            total_temporal += temporal
+
+        # output array buffers
+        indices_buffer = np.empty(total_cell_count * 2, dtype=np.int64)
+        full_seqlens = np.empty(total_temporal, dtype=np.int64)
         window_seqlens = np.empty(total_window_count, dtype=np.int64)
-        cu_window_seqlens = np.empty(1 + total_window_count, dtype=np.int32)
+        cu_seqlens_buffer = np.empty(total_temporal + 1 + total_window_count + 1, dtype=np.int32)
+
+        # array views
+        window_indices = indices_buffer[:total_cell_count]
+        reverse_indices = indices_buffer[total_cell_count:]
+
+        cu_full_seqlens = cu_seqlens_buffer[:total_temporal + 1]
+        cu_window_seqlens = cu_seqlens_buffer[total_temporal + 1:]
+
+        # initialize cu_seqlens
+        cu_full_seqlens[0] = 0
         cu_window_seqlens[0] = 0
 
         # second pass: fill arrays
         current_index_offset = 0
         window_index_ptr = 0
-        seqlen_ptr = 0
+        window_seqlen_ptr = 0
+        full_seqlen_ptr = 0
+
         for i in range(grid_thw.shape[0]):
             temporal = grid_thw[i, 0]
             height = grid_thw[i, 1]
@@ -744,6 +765,12 @@ class Qwen2_5_VisionTransformer(nn.Module):
             num_blocks_width  = cdiv(merged_width, vit_merger_window_size)
 
             block_area = merged_height * merged_width
+
+            seqlen = width * height
+            for _ in range(temporal):
+                full_seqlens[full_seqlen_ptr] = seqlen
+                cu_full_seqlens[full_seqlen_ptr + 1] = cu_full_seqlens[full_seqlen_ptr] + seqlen
+                full_seqlen_ptr += 1
 
             for temporal_offset in range(0, temporal * block_area, block_area):
                 for block_offset_y in range(0, merged_height, vit_merger_window_size):
@@ -769,13 +796,71 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
                         window_index_ptr += cell_counter
                         cur_seqlen = cell_counter * spatial_merge_unit
-                        window_seqlens[seqlen_ptr] = cur_seqlen
-                        cu_window_seqlens[seqlen_ptr + 1] = cu_window_seqlens[seqlen_ptr] + cur_seqlen
-                        seqlen_ptr += 1
+                        window_seqlens[window_seqlen_ptr] = cur_seqlen
+                        cu_window_seqlens[window_seqlen_ptr + 1] = cu_window_seqlens[window_seqlen_ptr] + cur_seqlen
+                        window_seqlen_ptr += 1
 
             current_index_offset += temporal * merged_height * merged_width
 
-        return window_indices, reverse_indices, window_seqlens, cu_window_seqlens
+        return indices_buffer, full_seqlens, window_seqlens, cu_seqlens_buffer
+    
+    def get_window_index_and_seqlens(
+        self,
+        grid_thw: torch.Tensor,
+        device: Optional[torch.device] = None,
+    ) -> tuple[
+        torch.Tensor, # window_indices
+        torch.Tensor, # reverse_indices
+        torch.Tensor, # full_seqlens
+        torch.Tensor, # window_seqlens
+        torch.Tensor, # cu_full_seqlens
+        torch.Tensor, # cu_window_seqlens
+    ]:
+        (
+            indices_buffer, 
+            full_seqlens, window_seqlens,
+            cu_seqlens_buffer,
+        ) = self.get_window_index_and_seqlens_numba(
+            grid_thw.numpy(),
+            self.window_size,
+            self.spatial_merge_size,
+            self.patch_size,
+        )
+
+        # compute fused array buffer length
+        indices_length = indices_buffer.shape[0] // 2
+        cu_full_seqlens_length = full_seqlens.shape[0] + 1
+
+        # host tensor
+        full_seqlens = torch.from_numpy(full_seqlens)
+        window_seqlens = torch.from_numpy(window_seqlens)
+
+        # device tensor (fused copy)
+        indices_buffer = torch.from_numpy(indices_buffer)
+        cu_seqlens_buffer = torch.from_numpy(cu_seqlens_buffer)
+
+        if torch.jit.is_tracing():
+            cu_seqlens_buffer = cu_seqlens_buffer.to(torch.int64)
+
+        if device is None:
+            device = self.device
+        
+        indices_buffer = indices_buffer.to(device=device,
+                                           non_blocking=True)
+        cu_seqlens_buffer = cu_seqlens_buffer.to(device=device,
+                                                 non_blocking=True)
+        
+        # create device tensor views
+        window_indices = indices_buffer[:indices_length]
+        reverse_indices = indices_buffer[indices_length:]
+        cu_full_seqlens = cu_seqlens_buffer[:cu_full_seqlens_length]
+        cu_window_seqlens = cu_seqlens_buffer[cu_full_seqlens_length:]
+
+        return (
+            window_indices, reverse_indices,
+            full_seqlens, window_seqlens,
+            cu_full_seqlens, cu_window_seqlens
+        )
 
     def compute_attn_mask_seqlen(
         self, seqlens: torch.Tensor
@@ -786,18 +871,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
         elif self.attn_backend == _Backend.XFORMERS:
             seqlens_list = seqlens.tolist()
         return max_seqlen, seqlens_list
-    
-    @staticmethod
-    def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
-        return F.pad(
-            seqlens.cumsum(
-                dim=0,
-                dtype=torch.int64 if torch.jit.is_tracing() else torch.int32,
-            ),
-            (1, 0),
-            "constant",
-            0,
-        )
 
     def forward(
         self,
@@ -811,40 +884,12 @@ class Qwen2_5_VisionTransformer(nn.Module):
         # compute position embedding
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        # full attention parameters
-        seqlens_full = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
-                                               grid_thw[:, 0])
-        cu_seqlens_full = seqlens_full.cumsum(
-            dim=0,
-            dtype=torch.int64 if torch.jit.is_tracing() else torch.int32,
-        )
-        cu_seqlens_full = F.pad(cu_seqlens_full, (1, 0), "constant", 0).to(
-            device=self.device,
-            non_blocking=True,
-        )
-
-        # window attention parameters
-        window_indices, reverse_indices, window_seqlens, cu_seqlens_window = self.get_window_index_numba(
-            grid_thw=grid_thw.numpy(),
-            window_size=self.window_size,
-            spatial_merge_size=self.spatial_merge_size,
-            patch_size=self.patch_size,
-        )
-        if torch.jit.is_tracing():
-            cu_seqlens_window = cu_seqlens_window.astype(np.int64)
-        
-        window_indices = torch.from_numpy(window_indices).to(
-            device=self.device,
-            non_blocking=True,
-        )
-        reverse_indices = torch.from_numpy(reverse_indices).to(
-            device=self.device,
-            non_blocking=True,
-        )
-        cu_seqlens_window = torch.from_numpy(cu_seqlens_window).to(
-            device=self.device,
-            non_blocking=True,
-        )
+        # full / window attention parameters
+        (
+            window_indices, reverse_indices,
+            seqlens_full, seqlens_window, 
+            cu_seqlens_full, cu_seqlens_window,
+        ) = self.get_window_index_and_seqlens(grid_thw)
 
         # reshape
         seq_len, _ = hidden_states.size()
@@ -864,7 +909,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         max_seqlen_full, seqlens_list_full = self.compute_attn_mask_seqlen(
             seqlens_full)
         max_seqlen_window, seqlens_list_window = self.compute_attn_mask_seqlen(
-            window_seqlens)
+            seqlens_window)
 
         for layer_num, blk in enumerate(self.blocks):
             if layer_num in self.fullatt_block_indexes:
