@@ -5,8 +5,10 @@ from numba.extending import intrinsic
 from numba.core.cgutils import raw_memcpy
 
 @intrinsic
-def numba_memcpy(typingctx, dst, dst_offset, src, src_offset, elem_count):
-    assert dst.dtype == src.dtype
+def numba_array_memcpy(typingctx, dst_arr, dst_offset, src_arr, src_offset, elem_count):
+    """calling C memcpy for numpy array in numba no-python code"""
+
+    assert dst_arr.dtype == src_arr.dtype
 
     def codegen(context, builder, signature, args):
         dst, dst_offset, src, src_offset, elem_count = args
@@ -20,36 +22,11 @@ def numba_memcpy(typingctx, dst, dst_offset, src, src_offset, elem_count):
         return context.get_dummy_value()
     
     sig = types.void(
-        types.CPointer(dst.dtype),
+        types.CPointer(dst_arr.dtype),
         dst_offset,
-        types.CPointer(dst.dtype),
+        types.CPointer(dst_arr.dtype),
         src_offset,
         elem_count,
     )
     
     return sig, codegen
-
-from numba import jit
-
-@jit(nopython=True, inline="always")
-def numba_replicate_exponential(arr, start_pos, repeat_elem_num, repeat_times):
-    """
-    repeat by exponential
-
-    e.g.:
-    1. arr[start_pos : start_pos + r * 1] = arr[start_pos - r : start_pos]
-    2. arr[start_pos + r * 1 : start_pos + r * 3] = arr[start_pos - r : start_pos + r * 1]
-    3. arr[start_pos + r * 3 : start_pos + r * 7] = arr[start_pos - r : start_pos + r * 3]
-    ...
-    """
-    num_elem_left = repeat_times * repeat_elem_num
-    num_step_elem = repeat_elem_num
-    
-    while num_step_elem <= num_elem_left:
-        numba_memcpy(arr, start_pos, arr, start_pos - num_step_elem, num_step_elem)
-        start_pos += num_step_elem
-        num_elem_left -= num_step_elem
-        num_step_elem <<= 1 # num_step_elem *= 2
-    
-    if num_elem_left > 0:
-        numba_memcpy(arr, start_pos, arr, start_pos - num_elem_left, num_elem_left)

@@ -57,7 +57,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig
-from vllm.numba_utils import numba_replicate_exponential
 from vllm.platforms import _Backend
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import uses_mrope
@@ -67,6 +66,7 @@ from .interfaces import (MultiModalEmbeddings, SupportsLoRA,
 from .qwen2_vl import Qwen2VLDummyInputsBuilder as Qwen2_5_VLDummyInputsBuilder
 from .qwen2_vl import (Qwen2VLMultiModalProcessor, Qwen2VLProcessingInfo,
                        apply_rotary_pos_emb_vision)
+from .qwen2_vl import Qwen2VLRotPosSeq
 from .utils import (AutoWeightsLoader, WeightsMapper, cast_overflow_tensors,
                     init_vllm_registered_model, maybe_prefix,
                     merge_multimodal_embeddings)
@@ -498,6 +498,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         norm_eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        max_position_embeddings: int = 32768,
     ) -> None:
         super().__init__()
 
@@ -547,6 +548,12 @@ class Qwen2_5_VisionTransformer(nn.Module):
         )
         self.attn_backend: _Backend = get_vit_attn_backend(support_fa=True)
 
+        self.rot_pos_seq = Qwen2VLRotPosSeq(
+            spatial_merge_size=self.spatial_merge_size,
+            max_position_embeddings=max_position_embeddings,
+            device=self.device,
+        )
+
     @property
     def dtype(self) -> torch.dtype:
         return self.patch_embed.proj.weight.dtype
@@ -555,91 +562,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
 
-    def compute_rot_pos_torch(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        pos_ids = []
-        for t, h, w in grid_thw:
-            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
-            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
-            hpos_ids = hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            ).permute(0, 2, 1, 3).flatten()
-            wpos_ids = wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            ).permute(0, 2, 1, 3).flatten()
-            pos_ids.append(
-                torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
-        
-        # avoid copy when there is only one tensor
-        if len(pos_ids) == 1:
-            return pos_ids[0]
-        
-        return torch.cat(pos_ids, dim=0)
-    
-    @staticmethod
-    @jit(nopython=True)
-    def compute_rot_pos_numba(
-        grid_thw: np.ndarray,
-        spatial_merge_size: int,
-    ) -> np.ndarray:
-        """
-        numba optimized version of compute_rot_pos_torch
-        """
-        l = 0
-        for i in range(len(grid_thw)):
-            l += grid_thw[i, 0] * grid_thw[i, 1] * grid_thw[i, 2]
-        
-        arr = np.empty((l, 2), dtype=np.int64)
-        arr_ptr = arr.ctypes
-        
-        pos = 0
-        for i in range(len(grid_thw)):
-            num_t = grid_thw[i, 0].item()
-            num_h = grid_thw[i, 1].item()
-            num_w = grid_thw[i, 2].item()
-            hw = num_h * num_w
-            
-            if spatial_merge_size == 2:
-                # further optimized for spatial_merge_size == 2
-                for h in range(0, num_h, 2):
-                    for w in range(0, num_w, 2):
-                        arr[pos, 0] = h
-                        arr[pos, 1] = w
-                        arr[pos + 1, 0] = h
-                        arr[pos + 1, 1] = w + 1
-                        arr[pos + 2, 0] = h + 1
-                        arr[pos + 2, 1] = w
-                        arr[pos + 3, 0] = h + 1
-                        arr[pos + 3, 1] = w + 1
-                        pos += 4
-            else:
-                for h in range(0, grid_thw[i, 1], spatial_merge_size):
-                    for w in range(0, grid_thw[i, 2], spatial_merge_size):
-                        for m_x in range(spatial_merge_size):
-                            for m_y in range(spatial_merge_size):
-                                arr[pos, 0] = h + m_x
-                                arr[pos, 1] = w + m_y
-                                pos += 1
-            
-            if num_t > 1:
-                numba_replicate_exponential(arr_ptr, pos * 2, hw * 2, num_t - 1)
-                pos += hw * (num_t - 1)
-        
-        return arr
-    
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        pos_ids = torch.from_numpy(
-            self.compute_rot_pos_numba(
-                grid_thw.numpy(),
-                self.spatial_merge_size,
-            )
-        )
-        pos_ids = pos_ids.to(self.device, non_blocking=True)
+        pos_ids = self.rot_pos_seq(grid_thw)
         
         max_grid_size = grid_thw[:, 1:].max().item()
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
@@ -1046,6 +970,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             quant_config=self._maybe_ignore_quant_config(quant_config),
             prefix=maybe_prefix(prefix, "visual"),
+            max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
         )
 
         self.language_model = init_vllm_registered_model(
