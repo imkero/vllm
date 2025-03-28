@@ -606,9 +606,21 @@ class Qwen2VLRotPosSeq:
     @torch.jit.script
     def _forward_torch_enhanced(
         grid_thw: torch.Tensor,
+        # spatial_merge_size: 
+        # - in most case = 2
         spatial_merge_size: int,
         device: torch.device,
+        # embedding_position_seq:
+        # - preallocated constant seq
+        # - example: tensor([0, 1, 2, ..., 32767])
         embedding_position_seq: torch.Tensor,
+        # merge_unit_delta:
+        # - h / w delta inside a merge unit
+        # - also a constant for a specific `spatial_merge_size``
+        # - example: tensor([[0, 0],
+        #                    [0, 1],
+        #                    [1, 0],
+        #                    [1, 1]])
         merge_unit_delta: torch.Tensor,
     ) -> torch.Tensor:
         out = torch.empty(
@@ -624,9 +636,11 @@ class Qwen2VLRotPosSeq:
         for i, (t, h, w) in enumerate(l):
             # fuse [[1, h, w], [2, h, w]] into [[0, h, w], [3, h, w]]
             # (to make full use of device parallelism)
-            if i < len(l) -1 and l[i + 1][1] == h and l[i + 1][2] == w:
-                l[i + 1][0] += t
-                continue
+            if i < len(l) -1:
+                next_item = l[i + 1]
+                if next_item[1] == h and next_item[2] == w:
+                    next_item[0] += t
+                    continue
             
             seqlen = t * h * w
 
