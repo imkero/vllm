@@ -3,7 +3,7 @@
 from ctypes import c_void_p
 from typing import overload
 
-from numba import types
+from numba import types, jit
 from numba.extending import intrinsic
 from numba.core.cgutils import raw_memcpy
 
@@ -39,3 +39,8 @@ def numba_array_memcpy(typingctx, dst_arr, dst_offset, src_arr, src_offset, elem
     )
     
     return sig, codegen
+
+@jit(nopython=True, inline="always")
+def numba_cdiv(a, b):
+    """ceiling division"""
+    return -(-a // b)

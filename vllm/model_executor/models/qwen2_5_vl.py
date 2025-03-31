@@ -57,6 +57,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig
+from vllm.numba_utils import numba_cdiv
 from vllm.platforms import _Backend
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.config import uses_mrope
@@ -485,10 +486,6 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
         self.update_freqs_cache(seqlen)
         return self._freqs_cached[:seqlen]
 
-@jit(nopython=True, inline="always")
-def cdiv(a, b):
-    """ceiling division"""
-    return -(-a // b)
 
 class Qwen2_5_VisionAttentionScheduler:
     spatial_merge_size: int
@@ -627,8 +624,8 @@ class Qwen2_5_VisionAttentionScheduler:
 
             total_cell_count += temporal * merged_height * merged_width
 
-            num_blocks_height = cdiv(merged_height, vit_merger_window_size)
-            num_blocks_width = cdiv(merged_width, vit_merger_window_size)
+            num_blocks_height = numba_cdiv(merged_height, vit_merger_window_size)
+            num_blocks_width = numba_cdiv(merged_width, vit_merger_window_size)
 
             total_window_count += temporal * num_blocks_height * num_blocks_width
 
@@ -662,8 +659,8 @@ class Qwen2_5_VisionAttentionScheduler:
             merged_height = height // spatial_merge_size
             merged_width = width // spatial_merge_size
 
-            num_blocks_height = cdiv(merged_height, vit_merger_window_size)
-            num_blocks_width  = cdiv(merged_width, vit_merger_window_size)
+            num_blocks_height = numba_cdiv(merged_height, vit_merger_window_size)
+            num_blocks_width  = numba_cdiv(merged_width, vit_merger_window_size)
 
             block_area = merged_height * merged_width
 
