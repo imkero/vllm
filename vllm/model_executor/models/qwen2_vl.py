@@ -532,8 +532,12 @@ class Qwen2VisionRotaryEmbedding(nn.Module):
         self.update_freqs_cache(seqlen)
         return self._freqs_cached[:seqlen]
 
-class Qwen2VLRotPosSeq:
+class Qwen2VLRotPosGenerator:
     spatial_merge_size: int
+    device: torch.device
+    embedding_position_seq: torch.Tensor
+    merge_unit_delta: torch.Tensor
+
     def __init__(
         self,
         spatial_merge_size: int,
@@ -544,6 +548,8 @@ class Qwen2VLRotPosSeq:
         self.device = device
 
         if device.type != "cpu":
+            # preallocated constant seq
+            # - example: tensor([0, 1, 2, ..., 32767])
             self.embedding_position_seq = torch.arange(
                 start=0,
                 end=max_position_embeddings,
@@ -562,12 +568,18 @@ class Qwen2VLRotPosSeq:
             merge_unit_delta_w = merge_seq.repeat(spatial_merge_size)
 
             # shape: (spatial_merge_size * spatial_merge_size, 2)
+            # - h / w delta inside a merge unit
+            # - fixed for a specific `spatial_merge_size`
+            # - example: tensor([[0, 0],
+            #                    [0, 1],
+            #                    [1, 0],
+            #                    [1, 1]])
             self.merge_unit_delta = torch.stack([
                 merge_unit_delta_h,
                 merge_unit_delta_w
             ], dim=1).to(device)
 
-    def forward_torch(self, grid_thw: torch.Tensor) -> torch.Tensor:
+    def generate_torch(self, grid_thw: torch.Tensor) -> torch.Tensor:
         pos_ids = []
         for t, h, w in grid_thw:
             hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
@@ -593,8 +605,8 @@ class Qwen2VLRotPosSeq:
         
         return torch.cat(pos_ids, dim=0)
     
-    def forward_torch_enhanced(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        return self._forward_torch_enhanced(
+    def generate_torch_fused(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        return self._generate_torch_fused(
             grid_thw,
             self.spatial_merge_size,
             self.device,
@@ -604,23 +616,13 @@ class Qwen2VLRotPosSeq:
 
     @staticmethod
     @torch.jit.script
-    def _forward_torch_enhanced(
+    def _generate_torch_fused(
         grid_thw: torch.Tensor,
-        # spatial_merge_size: 
-        # - in most case = 2
         spatial_merge_size: int,
         device: torch.device,
-        # embedding_position_seq:
-        # - preallocated constant seq
-        # - example: tensor([0, 1, 2, ..., 32767])
+        
         embedding_position_seq: torch.Tensor,
-        # merge_unit_delta:
-        # - h / w delta inside a merge unit
-        # - also a constant for a specific `spatial_merge_size``
-        # - example: tensor([[0, 0],
-        #                    [0, 1],
-        #                    [1, 0],
-        #                    [1, 1]])
+        
         merge_unit_delta: torch.Tensor,
     ) -> torch.Tensor:
         out = torch.empty(
@@ -636,7 +638,7 @@ class Qwen2VLRotPosSeq:
         for i, (t, h, w) in enumerate(l):
             # fuse [[1, h, w], [2, h, w]] into [[0, h, w], [3, h, w]]
             # (to make full use of device parallelism)
-            if i < len(l) -1:
+            if i < len(l) - 1:
                 next_item = l[i + 1]
                 if next_item[1] == h and next_item[2] == w:
                     next_item[0] += t
@@ -669,7 +671,7 @@ class Qwen2VLRotPosSeq:
     
     @staticmethod
     @jit(nopython=True)
-    def _forward_numba(
+    def _generate_numba(
         grid_thw: np.ndarray,
         spatial_merge_size: int,
     ) -> np.ndarray:
@@ -677,21 +679,30 @@ class Qwen2VLRotPosSeq:
         numba optimized version of compute_rot_pos_torch
         """
         l = 0
-        for i in range(len(grid_thw)):
+        for i in range(grid_thw.shape[0]):
             l += grid_thw[i, 0] * grid_thw[i, 1] * grid_thw[i, 2]
         
         arr = np.empty((l, 2), dtype=np.int64)
         arr_ptr = arr.ctypes
         
+        fused_t = 0
         pos = 0
-        for i in range(len(grid_thw)):
-            num_t = grid_thw[i, 0].item()
-            num_h = grid_thw[i, 1].item()
-            num_w = grid_thw[i, 2].item()
+        for i in range(grid_thw.shape[0]):
+            num_t = grid_thw[i, 0]
+            num_h = grid_thw[i, 1]
+            num_w = grid_thw[i, 2]
+
+            if i < grid_thw.shape[0] - 1 and grid_thw[i + 1, 1] == num_h and grid_thw[i + 1, 2] == num_w:
+                fused_t += num_t
+                continue
+
+            num_t += fused_t
+            fused_t = 0
+
             hw = num_h * num_w
 
             if spatial_merge_size == 2:
-                # further optimized for spatial_merge_size == 2 by unroll
+                # further optimized for spatial_merge_size == 2
                 for h in range(0, num_h, 2):
                     for w in range(0, num_w, 2):
                         arr[pos, 0] = h
@@ -719,14 +730,14 @@ class Qwen2VLRotPosSeq:
 
         return arr
     
-    def forward_numba(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        return torch.from_numpy(self._forward_numba(grid_thw.numpy(), self.spatial_merge_size))
+    def generate_numba(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        return torch.from_numpy(self._generate_numba(grid_thw.numpy(), self.spatial_merge_size))
 
-    def forward(self, grid_thw: torch.Tensor) -> torch.Tensor:
+    def generate(self, grid_thw: torch.Tensor) -> torch.Tensor:
         if self.device.type == "cpu":
-            return self.forward_numba(grid_thw)
+            return self.generate_numba(grid_thw)
 
-        return self.forward_torch_enhanced(grid_thw)
+        return self.generate_torch_fused(grid_thw)
 
 class Qwen2VisionTransformer(nn.Module):
 
@@ -783,7 +794,7 @@ class Qwen2VisionTransformer(nn.Module):
         )
         self.attn_backend: _Backend = get_vit_attn_backend(support_fa=True)
 
-        self.rot_pos_seq = Qwen2VLRotPosSeq(
+        self.rot_pos_generator = Qwen2VLRotPosGenerator(
             spatial_merge_size=spatial_merge_size,
             max_position_embeddings=max_position_embeddings, # TODO
             device=self.device,
@@ -798,7 +809,7 @@ class Qwen2VisionTransformer(nn.Module):
         return self.patch_embed.proj.weight.device
     
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        pos_ids = self.rot_pos_seq(grid_thw)
+        pos_ids = self.rot_pos_generator.generate(grid_thw)
         
         max_grid_size = grid_thw[:, 1:].max().item()
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
