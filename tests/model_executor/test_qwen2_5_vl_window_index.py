@@ -24,25 +24,17 @@ def test_qwen2_5_vl_get_window_indices_correctness(window_size, patch_size, spat
                     dtype=torch.int64,
                 )
                 
-                # torch impl
-                def torch_impl():
-                    return scheduler.get_window_index_and_seqlens_torch(grid_thw)
-
-                # numba impl
-                def numba_impl():
-                    return scheduler.get_window_index_and_seqlens_numba(grid_thw)
-                
                 (
                     window_indices_torch, reverse_indices_torch,
                     seqlens_full_torch, seqlens_window_torch,
                     cu_seqlens_full_torch, cu_seqlens_window_torch,
-                ) = torch_impl()
+                ) = scheduler.generate_by_torch(grid_thw)
 
                 (
                     window_indices_numba, reverse_indices_numba,
                     seqlens_full_numba, seqlens_window_numba, 
                     cu_seqlens_full_numba, cu_seqlens_window_numba,
-                ) = numba_impl()
+                ) = scheduler.generate_by_numba(grid_thw)
 
                 get_assertion_msg = lambda: f"mismatch at grid_thw={grid_thw}"
 

@@ -514,7 +514,7 @@ class Qwen2_5_VisionAttentionScheduler:
             device=device,
         )
 
-    def get_window_index_and_seqlens_torch(
+    def generate_by_torch(
         self,
         grid_thw: torch.Tensor,
     ) -> tuple[
@@ -586,28 +586,19 @@ class Qwen2_5_VisionAttentionScheduler:
 
     @staticmethod
     @jit(nopython=True)
-    def _get_window_index_and_seqlens_numba(
+    def _numba_kernel(
         grid_thw: np.ndarray,
         window_size: int,
         spatial_merge_size: int,
         patch_size: int,
     ) -> tuple[
-        np.ndarray, # indices (window_indices, reverse_indices, cu_full_seqlens and cu_window_seqlens)
+        np.ndarray, # output_buffer (concatenated window_indices, cu_full_seqlens and cu_window_seqlens)
         np.ndarray, # full_seqlens
         np.ndarray, # window_seqlens
-        int, # window_indices len
-        int, # cu_full_seqlens len
-        int, # cu_window_seqlens len
+        int, # length of window_indices
+        int, # length of cu_full_seqlens
+        int, # length of cu_window_seqlens
     ]:
-        """
-        numba optimized version of get_window_index_torch
-
-        NOTE:
-        - instead of returning tuple[window_indices, cu_window_seqlens],
-            it returns tuple[window_indices, reverse_indices, window_seqlens, cu_window_seqlens]
-        - it prevents zero in `window_seqlens`, so there is no need to call 
-            `torch.unique_consecutive` on cu_window_seqlens
-        """
         spatial_merge_unit = spatial_merge_size * spatial_merge_size
         vit_merger_window_size = window_size // spatial_merge_size // patch_size
 
@@ -638,7 +629,7 @@ class Qwen2_5_VisionAttentionScheduler:
 
         # array views
         window_indices = output_buffer[:total_cell_count]
-        cu_full_seqlens = output_buffer[total_cell_count:total_cell_count * 2 + total_temporal + 1]
+        cu_full_seqlens = output_buffer[total_cell_count:total_cell_count + total_temporal + 1]
         cu_window_seqlens = output_buffer[total_cell_count + total_temporal + 1:]
 
         # initialize cu_seqlens
@@ -689,6 +680,7 @@ class Qwen2_5_VisionAttentionScheduler:
                                 cell_counter += 1
 
                         window_index_ptr += cell_counter
+
                         cur_seqlen = cell_counter * spatial_merge_unit
                         window_seqlens[window_seqlen_ptr] = cur_seqlen
                         cu_window_seqlens[window_seqlen_ptr + 1] = cu_window_seqlens[window_seqlen_ptr] + cur_seqlen
@@ -698,7 +690,7 @@ class Qwen2_5_VisionAttentionScheduler:
 
         return output_buffer, full_seqlens, window_seqlens, total_cell_count, total_temporal + 1, total_window_count + 1
     
-    def get_window_index_and_seqlens_numba(
+    def generate_by_numba(
         self,
         grid_thw: torch.Tensor,
     ) -> tuple[
@@ -709,37 +701,45 @@ class Qwen2_5_VisionAttentionScheduler:
         torch.Tensor, # cu_full_seqlens
         torch.Tensor, # cu_window_seqlens
     ]:
+        """
+        numba optimized version of generate_by_torch
+
+        NOTE:
+        - it prevents zero in `window_seqlens`, so there is no need to call 
+            `torch.unique_consecutive` on cu_window_seqlens
+        """
+
+        # step 1: run numba kernel
         (
             output_buffer,
             full_seqlens, window_seqlens,
             indices_length,
             cu_full_seqlens_length, cu_window_seqlens_length,
-        ) = self._get_window_index_and_seqlens_numba(
+        ) = self._numba_kernel(
             grid_thw.numpy(),
             self.window_size,
             self.spatial_merge_size,
             self.patch_size,
         )
 
-        # host tensor
+        output_buffer = torch.from_numpy(output_buffer)
         full_seqlens = torch.from_numpy(full_seqlens)
         window_seqlens = torch.from_numpy(window_seqlens)
-
-        # device tensor (fused copy)
-        output_buffer = torch.from_numpy(output_buffer).to(
-            device=self.device,
+        
+        # step 2: move necessary data to device (batch all tensors into a buffer)
+        output_buffer = output_buffer.to(device=self.device,
             non_blocking=True)
-        reverse_indices = torch.empty(indices_length,
-            device=self.device,
-            dtype=torch.int64)
 
-        # create device tensor views
+        # step 3: post-processing
+
+        # - create views from buffer tensor
         window_indices, cu_seqlens_buffer = output_buffer.split([indices_length, cu_full_seqlens_length + cu_window_seqlens_length])
         cu_seqlens_buffer = cu_seqlens_buffer.to(torch.int32)
         cu_full_seqlens, cu_window_seqlens = cu_seqlens_buffer.split([cu_full_seqlens_length, cu_window_seqlens_length])
 
-        # build reverse_indices
-        reverse_indices[window_indices] = self.position_seq[:indices_length]
+        # - build reverse_indices
+        reverse_indices = torch.empty(indices_length, dtype=torch.int64, device=self.device)
+        reverse_indices.index_put_((window_indices, ), self.position_seq[:indices_length])
 
         return (
             window_indices, reverse_indices,
@@ -863,7 +863,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
             window_indices, reverse_indices,
             seqlens_full, seqlens_window, 
             cu_seqlens_full, cu_seqlens_window,
-        ) = self.vision_attn_scheduler.get_window_index_and_seqlens_numba(grid_thw)
+        ) = self.vision_attn_scheduler.generate_by_numba(grid_thw)
 
         # reshape
         seq_len, _ = hidden_states.size()

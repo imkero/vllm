@@ -3,23 +3,56 @@
 from ctypes import c_void_p
 from typing import overload
 
+from llvmlite import ir
 from numba import types, jit
+from numba.core.typing.templates import Signature
+from numba.core.typing.context import BaseContext as TypingContext
+from numba.core.base import BaseContext
 from numba.extending import intrinsic
 from numba.core.cgutils import raw_memcpy
 
 
 @overload
 def numba_array_memcpy(dst_arr: c_void_p, dst_offset: int, src_arr: c_void_p, src_offset: int, elem_count: int) -> None:
+    """
+    memcpy for numpy array in numba nopython mode
+
+    NOTE:
+    - pass `dst_arr` and `src_arr` arg by `arr.ctypes`
+    """
     ...
 
 @intrinsic(inline=True)
-def numba_array_memcpy(typingctx, dst_arr, dst_offset, src_arr, src_offset, elem_count):
-    """calling C memcpy for numpy array in numba no-python code"""
+def numba_array_memcpy(
+    typingctx: TypingContext,
+    dst_arr: types.ArrayCTypes,
+    dst_offset: types.Integer,
+    src_arr: types.ArrayCTypes,
+    src_offset: types.Integer,
+    elem_count: types.Integer,
+):
+    """
+    memcpy for numpy array in numba nopython mode
+
+    NOTE:
+    - this is the llvm ir code generator, for actual usage please see the overload above
+    """
 
     assert dst_arr.dtype == src_arr.dtype, \
         f"dst_arr and src_arr must have the same dtype"
 
-    def codegen(context, builder, signature, args):
+    def codegen(
+        context: BaseContext,
+        builder: ir.IRBuilder,
+        signature: Signature,
+        args: tuple[
+            ir.Value,
+            ir.Value,
+            ir.Value,
+            ir.Value,
+            ir.Value,
+        ],
+    ):
         dst, dst_offset, src, src_offset, elem_count = args
 
         dst_ptr = builder.gep(dst, [dst_offset])
@@ -33,7 +66,7 @@ def numba_array_memcpy(typingctx, dst_arr, dst_offset, src_arr, src_offset, elem
     sig = types.void(
         types.CPointer(dst_arr.dtype),
         dst_offset,
-        types.CPointer(dst_arr.dtype),
+        types.CPointer(src_arr.dtype),
         src_offset,
         elem_count,
     )
@@ -41,6 +74,6 @@ def numba_array_memcpy(typingctx, dst_arr, dst_offset, src_arr, src_offset, elem
     return sig, codegen
 
 @jit(nopython=True, inline="always")
-def numba_cdiv(a, b):
-    """ceiling division"""
+def numba_cdiv(a: int, b: int) -> int:
+    """inline ceiling division in numba nopython mode"""
     return -(-a // b)

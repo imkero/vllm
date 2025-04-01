@@ -606,7 +606,14 @@ class Qwen2VLRotPosGenerator:
         return torch.cat(pos_ids, dim=0)
     
     def generate_torch_fused(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        return self._generate_torch_fused(
+        """
+        optimized version of `generate_torch`
+
+        suitable for running on device
+
+        NOTE: actual impl is a staticmethod to make it `torch.jit` compilable
+        """
+        return self._generate_torch_fused_jit(
             grid_thw,
             self.spatial_merge_size,
             self.device,
@@ -616,15 +623,18 @@ class Qwen2VLRotPosGenerator:
 
     @staticmethod
     @torch.jit.script
-    def _generate_torch_fused(
+    def _generate_torch_fused_jit(
         grid_thw: torch.Tensor,
         spatial_merge_size: int,
         device: torch.device,
-        
         embedding_position_seq: torch.Tensor,
-        
         merge_unit_delta: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        optimized version of `generate_torch`
+
+        suitable for running on device
+        """
         out = torch.empty(
             (int(grid_thw.prod(dim=1).sum().item()), 2),
             dtype=torch.int64,
@@ -676,7 +686,9 @@ class Qwen2VLRotPosGenerator:
         spatial_merge_size: int,
     ) -> np.ndarray:
         """
-        numba optimized version of compute_rot_pos_torch
+        numba optimized version of `generate_torch`
+
+        suitable for running on cpu
         """
         l = 0
         for i in range(grid_thw.shape[0]):
