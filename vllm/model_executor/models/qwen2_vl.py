@@ -842,12 +842,8 @@ class Qwen2VisionTransformer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        grid_thw: torch.Tensor, # on CPU
+        grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        # DEBUG
-        assert grid_thw.is_cpu()
-        grid_thw = grid_thw.cpu()
-        
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -1072,7 +1068,7 @@ class Qwen2VLProcessingInfo(BaseProcessingInfo):
                 width=image_width,
                 factor=patch_size * merge_size,
                 min_pixels=image_processor.min_pixels,
-                max_pixels=image_processor.max_pixels,
+                max_pixels=4096*28*28,
             )
             preprocessed_size = ImageSize(width=resized_width,
                                           height=resized_height)
