@@ -25,6 +25,8 @@
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numba
+import numpy as np
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
@@ -1404,15 +1406,19 @@ class MRotaryEmbedding(RotaryEmbedding):
         ]
 
     @staticmethod
-    def get_next_input_positions_tensor(
+    @numba.jit(nopython=True)
+    def assign_next_input_positions(
+        out: np.ndarray,
+        out_offset: int,
         mrope_position_delta: int,
         context_len: int,
-        seq_len: int,
-    ) -> torch.Tensor:
-        return torch.arange(
-            mrope_position_delta + context_len,
-            mrope_position_delta + seq_len,
-        ).expand(3, -1)
+        num_new_tokens: int,
+    ):
+        start_pos = mrope_position_delta + context_len
+        for dim in range(3):
+            for idx in range(num_new_tokens):
+                out[dim,
+                    out_offset + idx] = start_pos + idx
 
     @classmethod
     def omni_get_updates_use_audio_in_video(

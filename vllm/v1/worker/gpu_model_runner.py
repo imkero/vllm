@@ -238,6 +238,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dtype=torch.int64,
                 device="cpu",
                 pin_memory=self.pin_memory)
+            
+            # NOTE: `mrope_positions_np` shares same
+            # underlying data with `mrope_positions_cpu`.
+            #
+            # `mrope_positions_np` is created in favor of
+            # numba accelerated func `assign_next_input_positions`
+            # while it can operate numpy array only.
+            self.mrope_positions_np = self.mrope_positions_cpu.numpy()
 
         # Only relevant for models using ALiBi (e.g, MPT)
         self.use_alibi = check_use_alibi(model_config)
@@ -751,19 +759,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             if completion_part_len > 0:
                 # compute completion's mrope_positions on-the-fly
-                dst_start = mrope_pos_ptr
-                dst_end = mrope_pos_ptr + completion_part_len
-
-                self.mrope_positions_cpu[:, dst_start:dst_end] = \
-                    MRotaryEmbedding.get_next_input_positions_tensor(
-                        req.mrope_position_delta,
-                        context_len=num_computed_tokens +
-                        prompt_part_len,
-                        seq_len=num_computed_tokens +
-                        prompt_part_len +
-                        completion_part_len,
-                    )
-
+                # OPTIMIZATION: fuse compute & copy for speedup
+                MRotaryEmbedding.assign_next_input_positions(
+                    out=self.mrope_positions_np,
+                    out_offset=mrope_pos_ptr,
+                    mrope_position_delta=req.mrope_position_delta,
+                    context_len=num_computed_tokens + prompt_part_len,
+                    num_new_tokens=completion_part_len,
+                )
                 mrope_pos_ptr += completion_part_len
 
     def _calc_spec_decode_metadata(
