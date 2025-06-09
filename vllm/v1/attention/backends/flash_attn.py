@@ -655,6 +655,21 @@ class FlashAttentionImpl(AttentionImpl):
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, key.shape[1])
 
+            print(f"[DEBUG FA direct] q.shape: {query[:num_actual_tokens].shape}, "
+                  f"k.shape: {key_cache.shape}, v.shape: {value_cache.shape}, "
+                  f"cu_seqlens_q.shape: {cu_seqlens_q.shape}, "
+                  f"seqused_k.shape: {seqused_k.shape}, "
+                  f"max_seqlen_q: {max_seqlen_q}, max_seqlen_k: {max_seqlen_k}")
+            if layer._q_scale is not None:
+                print(f"[DEBUG FA direct] q_descale.shape: {layer._q_scale.expand(descale_shape).shape}")
+            if layer._k_scale is not None:
+                print(f"[DEBUG FA direct] k_descale.shape: {layer._k_scale.expand(descale_shape).shape}")
+            if layer._v_scale is not None:
+                print(f"[DEBUG FA direct] v_descale.shape: {layer._v_scale.expand(descale_shape).shape}")
+
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
             flash_attn_varlen_func(
                 q=query[:num_actual_tokens],
                 k=key_cache,
@@ -676,6 +691,9 @@ class FlashAttentionImpl(AttentionImpl):
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
             )
+            end_event.record()
+            torch.cuda.synchronize()
+            print(f"[TIME FA direct] {start_event.elapsed_time(end_event)} ms")
             return output
 
         assert not use_local_attn, (
@@ -812,6 +830,21 @@ def cascade_attention(
     assert num_common_kv_blocks > 0
     descale_shape = (cu_prefix_query_lens.shape[0] - 1, key_cache.shape[-2])
 
+    print(f"[DEBUG FA cascade prefix] q.shape: {query.shape}, "
+          f"k.shape: {key_cache.shape}, v.shape: {value_cache.shape}, "
+          f"cu_seqlens_q.shape: {cu_prefix_query_lens.shape}, "
+          f"seqused_k.shape: {prefix_kv_lens.shape}, "
+          f"max_seqlen_q: {num_tokens}, max_seqlen_k: {common_prefix_len}")
+    if q_descale is not None:
+        print(f"[DEBUG FA cascade prefix] q_descale.shape: {q_descale.expand(descale_shape).shape}")
+    if k_descale is not None:
+        print(f"[DEBUG FA cascade prefix] k_descale.shape: {k_descale.expand(descale_shape).shape}")
+    if v_descale is not None:
+        print(f"[DEBUG FA cascade prefix] v_descale.shape: {v_descale.expand(descale_shape).shape}")
+
+    start_event_prefix = torch.cuda.Event(enable_timing=True)
+    end_event_prefix = torch.cuda.Event(enable_timing=True)
+    start_event_prefix.record()
     # Process shared prefix.
     prefix_output, prefix_lse = flash_attn_varlen_func(
         q=query,
@@ -836,9 +869,27 @@ def cascade_attention(
         v_descale=v_descale.expand(descale_shape)
         if v_descale is not None else None,
     )
+    end_event_prefix.record()
+    torch.cuda.synchronize()
+    print(f"[TIME FA cascade prefix] {start_event_prefix.elapsed_time(end_event_prefix)} ms")
 
     descale_shape = (cu_query_lens.shape[0] - 1, key_cache.shape[-2])
 
+    print(f"[DEBUG FA cascade suffix] q.shape: {query.shape}, "
+          f"k.shape: {key_cache.shape}, v.shape: {value_cache.shape}, "
+          f"cu_seqlens_q.shape: {cu_query_lens.shape}, "
+          f"seqused_k.shape: {suffix_kv_lens.shape}, "
+          f"max_seqlen_q: {max_query_len}, max_seqlen_k: {max_kv_len - common_prefix_len}")
+    if q_descale is not None:
+        print(f"[DEBUG FA cascade suffix] q_descale.shape: {q_descale.expand(descale_shape).shape}")
+    if k_descale is not None:
+        print(f"[DEBUG FA cascade suffix] k_descale.shape: {k_descale.expand(descale_shape).shape}")
+    if v_descale is not None:
+        print(f"[DEBUG FA cascade suffix] v_descale.shape: {v_descale.expand(descale_shape).shape}")
+
+    start_event_suffix = torch.cuda.Event(enable_timing=True)
+    end_event_suffix = torch.cuda.Event(enable_timing=True)
+    start_event_suffix.record()
     # Process suffix per query.
     suffix_output, suffix_lse = flash_attn_varlen_func(
         q=query,
@@ -863,6 +914,9 @@ def cascade_attention(
         v_descale=v_descale.expand(descale_shape)
         if v_descale is not None else None,
     )
+    end_event_suffix.record()
+    torch.cuda.synchronize()
+    print(f"[TIME FA cascade suffix] {start_event_suffix.elapsed_time(end_event_suffix)} ms")
 
     # Merge prefix and suffix outputs, and store the result in output.
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output,
