@@ -100,6 +100,7 @@ from vllm.transformers_utils.tokenizer import MistralTokenizer
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import (Device, FlexibleArgumentParser, get_open_zmq_ipc_path,
                         is_valid_ipv6_address, set_ulimit)
+from vllm.iot_utils.polaris_service import PolarisServiceAutoRegister
 from vllm.v1.metrics.prometheus import get_prometheus_registry
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -114,6 +115,9 @@ _running_tasks: set[asyncio.Task] = set()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
+        # Instantiate PolarisServiceAutoRegister
+        polaris_service_register = PolarisServiceAutoRegister()
+
         if app.state.log_stats:
             engine_client: EngineClient = app.state.engine_client
 
@@ -132,11 +136,16 @@ async def lifespan(app: FastAPI):
         # Reduces pause times of oldest generation collections.
         gc.collect()
         gc.freeze()
+
+        # Start Polaris service registration
+        polaris_service_register.start()
         try:
             yield
         finally:
             if task is not None:
                 task.cancel()
+            # Stop Polaris service registration
+            polaris_service_register.stop()
     finally:
         # Ensure app state including engine ref is gc'd
         del app.state
