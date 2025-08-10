@@ -11,16 +11,15 @@ from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.multimodal.hasher import MultiModalHashDict
 from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalEncDecInputs,
                                     MultiModalInputs)
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.transformers_utils.tokenizer_group import TokenizerGroup
 
 from .data import (DecoderOnlyInputs, EmbedsInputs, EmbedsPrompt,
-                   EncoderDecoderInputs, ProcessorInputs, PromptType,
-                   SingletonInputs, SingletonPrompt, TextPrompt, TokenInputs,
-                   TokensPrompt, embeds_inputs, token_inputs)
+                   EncoderDecoderInputs, MultiModalHashes, ProcessorInputs,
+                   PromptType, SingletonInputs, SingletonPrompt, TextPrompt,
+                   TokenInputs, TokensPrompt, embeds_inputs, token_inputs)
 from .parse import is_explicit_encoder_decoder_prompt, parse_singleton_prompt
 
 logger = init_logger(__name__)
@@ -256,7 +255,7 @@ class InputPreprocessor:
         tokenization_kwargs: Optional[dict[str, Any]] = None,
         lora_request: Optional[LoRARequest] = None,
         return_mm_hashes: bool = False,
-        multi_modal_hash: Optional[MultiModalHashDict] = None,
+        multi_modal_hashes: Optional[MultiModalHashes] = None,
     ) -> MultiModalInputs:
         """
         Apply the model's multi-modal processor to a multi-modal prompt,
@@ -275,7 +274,7 @@ class InputPreprocessor:
                                   hf_processor_mm_kwargs=mm_processor_kwargs,
                                   tokenization_kwargs=tokenization_kwargs,
                                   return_mm_hashes=return_mm_hashes,
-                                  multi_modal_hash=multi_modal_hash)
+                                  multi_modal_hashes=multi_modal_hashes)
 
     async def _process_multimodal_async(
         self,
@@ -285,7 +284,7 @@ class InputPreprocessor:
         tokenization_kwargs: Optional[dict[str, Any]] = None,
         lora_request: Optional[LoRARequest] = None,
         return_mm_hashes: bool = False,
-        multi_modal_hash: Optional[MultiModalHashDict] = None,
+        multi_modal_hashes: Optional[MultiModalHashes] = None,
     ) -> MultiModalInputs:
         """
         Async version of
@@ -303,7 +302,7 @@ class InputPreprocessor:
                                   hf_processor_mm_kwargs=mm_processor_kwargs,
                                   tokenization_kwargs=tokenization_kwargs,
                                   return_mm_hashes=return_mm_hashes,
-                                  multi_modal_hash=multi_modal_hash)
+                                  multi_modal_hashes=multi_modal_hashes)
 
     def _process_embeds(
         self,
@@ -354,7 +353,7 @@ class InputPreprocessor:
                 tokenization_kwargs=tokenization_kwargs,
                 lora_request=lora_request,
                 return_mm_hashes=return_mm_hashes,
-                multi_modal_hash=parsed_content.get("multi_modal_hash"),
+                multi_modal_hashes=parsed_content.get("multi_modal_hashes"),
             )
         else:
             inputs = token_inputs(
@@ -386,7 +385,7 @@ class InputPreprocessor:
                 tokenization_kwargs=tokenization_kwargs,
                 lora_request=lora_request,
                 return_mm_hashes=return_mm_hashes,
-                multi_modal_hash=parsed_content.get("multi_modal_hash"),
+                multi_modal_hashes=parsed_content.get("multi_modal_hashes"),
             )
         else:
             inputs = token_inputs(
@@ -417,7 +416,7 @@ class InputPreprocessor:
                 tokenization_kwargs=tokenization_kwargs,
                 lora_request=lora_request,
                 return_mm_hashes=return_mm_hashes,
-                multi_modal_hash=parsed_content.get("multi_modal_hash"),
+                multi_modal_hashes=parsed_content.get("multi_modal_hashes"),
             )
         else:
             prompt_token_ids = self._tokenize_prompt(
@@ -453,7 +452,7 @@ class InputPreprocessor:
                 tokenization_kwargs=tokenization_kwargs,
                 lora_request=lora_request,
                 return_mm_hashes=return_mm_hashes,
-                multi_modal_hash=parsed_content.get("multi_modal_hash"),
+                multi_modal_hashes=parsed_content.get("multi_modal_hashes"),
             )
         else:
             prompt_token_ids = await self._tokenize_prompt_async(

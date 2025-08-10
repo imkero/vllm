@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Generic, Literal, Optional, Union, cast
 
 import torch
 from typing_extensions import NotRequired, TypedDict, TypeIs, TypeVar
 
 if TYPE_CHECKING:
-    from vllm.multimodal.hasher import MultiModalHashDict
     from vllm.multimodal.inputs import MultiModalDataDict, MultiModalInputs
+
+
+MultiModalHashes = Mapping[str, list[str]]
 
 
 class TextPrompt(TypedDict):
@@ -23,9 +25,9 @@ class TextPrompt(TypedDict):
     if the model supports it.
     """
 
-    multi_modal_hash: NotRequired["MultiModalHashDict"]
+    multi_modal_hashes: NotRequired[MultiModalHashes]
     """
-    Optional pre-computed hash for multi-modal data.
+    Optional pre-computed hashes for multi-modal data.
     """
 
     mm_processor_kwargs: NotRequired[dict[str, Any]]
@@ -57,9 +59,9 @@ class TokensPrompt(TypedDict):
     if the model supports it.
     """
 
-    multi_modal_hash: NotRequired["MultiModalHashDict"]
+    multi_modal_hashes: NotRequired[MultiModalHashes]
     """
-    Optional pre-computed hash for multi-modal data.
+    Optional pre-computed hashes for multi-modal data.
     """
 
     mm_processor_kwargs: NotRequired[dict[str, Any]]

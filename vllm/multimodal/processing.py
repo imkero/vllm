@@ -21,7 +21,7 @@ from vllm.transformers_utils.tokenizer import (AnyTokenizer, decode_tokens,
 from vllm.utils import flatten_2d_lists, full_groupby
 
 from .cache import MultiModalCache
-from .hasher import MultiModalHashDict, MultiModalHasher
+from .hasher import MultiModalHasher
 from .inputs import (MultiModalDataDict, MultiModalEncDecInputs,
                      MultiModalFieldConfig, MultiModalInputs, MultiModalKwargs,
                      MultiModalKwargsItem, PlaceholderRange)
@@ -1277,6 +1277,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         tokenization_kwargs: Mapping[str, object],
         *,
         enable_hf_prompt_update: bool,
+        multi_modal_hashes: Optional[MultiModalHashes] = None,
     ) -> tuple[list[int], "BatchFeature", bool]:
         """
         Apply the HF processor on the prompt text and multi-modal data.
@@ -1342,17 +1343,16 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
         tokenization_kwargs: Mapping[str, object],
-    ) -> MultiModalHashDict:
+    ) -> MultiModalHashes:
         """Create MM hashes to be returned (only used in V1)."""
         model_id = self.info.model_id
 
         return {
             modality: [
-                int(
-                    MultiModalHasher.hash_kwargs(model_id=model_id,
-                                                 **{modality: item},
-                                                 **hf_processor_mm_kwargs,
-                                                 **tokenization_kwargs))
+                MultiModalHasher.hash_kwargs(model_id=model_id,
+                                             **{modality: item},
+                                             **hf_processor_mm_kwargs,
+                                             **tokenization_kwargs)
                 for item in items
             ]
             for modality, items in mm_items.items()
@@ -1391,8 +1391,8 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         tokenization_kwargs: Mapping[str, object],
         *,
         return_mm_hashes: bool,
-        multi_modal_hash: Optional[MultiModalHashDict] = None,
-    ) -> tuple[list[int], MultiModalKwargs, Optional[MultiModalHashDict], bool]:
+        multi_modal_hashes: Optional[MultiModalHashes] = None,
+    ) -> tuple[list[int], MultiModalKwargs, Optional[MultiModalHashes], bool]:
         (
             prompt_ids,
             mm_processed_data,
@@ -1411,8 +1411,8 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
                                        hf_processor_mm_kwargs),
         )
 
-        if multi_modal_hash is not None:
-            mm_hashes = multi_modal_hash if return_mm_hashes else None
+        if multi_modal_hashes is not None:
+            mm_hashes = multi_modal_hashes if return_mm_hashes else None
         else:
             mm_hashes = (self._hash_mm_items(
                 mm_data_items, hf_processor_mm_kwargs, tokenization_kwargs)
@@ -1428,8 +1428,8 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         tokenization_kwargs: Mapping[str, object],
         *,
         return_mm_hashes: bool,
-        multi_modal_hash: Optional[MultiModalHashDict] = None,
-    ) -> tuple[list[int], MultiModalKwargs, Optional[MultiModalHashDict], bool]:
+        multi_modal_hashes: Optional[MultiModalHashes] = None,
+    ) -> tuple[list[int], MultiModalKwargs, Optional[MultiModalHashes], bool]:
         """
         Apply the HF processor on the full prompt text,
         caching the results and reusing cached results.
@@ -1444,11 +1444,11 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
                 hf_processor_mm_kwargs=hf_processor_mm_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
                 return_mm_hashes=return_mm_hashes,
-                multi_modal_hash=multi_modal_hash,
+                multi_modal_hashes=multi_modal_hashes,
             )
 
-        if multi_modal_hash is not None:
-            mm_hashes = multi_modal_hash
+        if multi_modal_hashes is not None:
+            mm_hashes = multi_modal_hashes
         else:
             mm_hashes = self._hash_mm_items(mm_data_items,
                                             hf_processor_mm_kwargs,
@@ -1477,6 +1477,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             hf_processor_mm_kwargs=hf_processor_mm_kwargs,
             tokenization_kwargs=tokenization_kwargs,
             enable_hf_prompt_update=False,
+            multi_modal_hashes=sub_multi_modal_hashes,
         )
 
         mm_missing_kwargs = MultiModalKwargs.from_hf_inputs(
@@ -1686,7 +1687,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         hf_processor_mm_kwargs: Mapping[str, object],
         tokenization_kwargs: Optional[Mapping[str, object]] = None,
         return_mm_hashes: bool = False,
-        multi_modal_hash: Optional[MultiModalHashDict] = None,
+        multi_modal_hashes: Optional[MultiModalHashes] = None,
     ) -> MultiModalInputs:
         """
         Process multi-modal inputs to be used in vLLM.
@@ -1703,6 +1704,17 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         """
         mm_items = self._to_mm_items(mm_data)
 
+        if multi_modal_hashes:
+            if set(mm_items.keys()) != set(multi_modal_hashes.keys()):
+                raise ValueError(
+                    "The keys in multi_modal_data and multi_modal_hashes "
+                    "must match.")
+            for modality, items in mm_items.items():
+                if len(items) != len(multi_modal_hashes[modality]):
+                    raise ValueError(
+                        f"The number of items for modality '{modality}' in "
+                        "multi_modal_data and multi_modal_hashes must match.")
+
         if tokenization_kwargs is None:
             tokenization_kwargs = {}
 
@@ -1717,7 +1729,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             hf_processor_mm_kwargs,
             tokenization_kwargs=tokenization_kwargs,
             return_mm_hashes=return_mm_hashes,
-            multi_modal_hash=multi_modal_hash,
+            multi_modal_hashes=multi_modal_hashes,
         )
 
         # NOTE: tokenization_kwargs are not required to init processor
@@ -1803,7 +1815,7 @@ class EncDecMultiModalProcessor(BaseMultiModalProcessor[_I]):
         hf_processor_mm_kwargs: Mapping[str, object],
         tokenization_kwargs: Optional[Mapping[str, object]] = None,
         return_mm_hashes: bool = False,
-        multi_modal_hash: Optional[MultiModalHashDict] = None,
+        multi_modal_hashes: Optional[MultiModalHashes] = None,
     ) -> MultiModalEncDecInputs:
         """
         Process multi-modal inputs to be used in vLLM.
@@ -1819,7 +1831,7 @@ class EncDecMultiModalProcessor(BaseMultiModalProcessor[_I]):
             hf_processor_mm_kwargs,
             tokenization_kwargs,
             return_mm_hashes,
-            multi_modal_hash=multi_modal_hash,
+            multi_modal_hashes=multi_modal_hashes,
         )
 
         return self._get_enc_dec_inputs(
