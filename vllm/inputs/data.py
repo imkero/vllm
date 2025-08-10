@@ -7,6 +7,7 @@ import torch
 from typing_extensions import NotRequired, TypedDict, TypeIs, TypeVar
 
 if TYPE_CHECKING:
+    from vllm.multimodal.hasher import MultiModalHashDict
     from vllm.multimodal.inputs import MultiModalDataDict, MultiModalInputs
 
 
@@ -20,6 +21,11 @@ class TextPrompt(TypedDict):
     """
     Optional multi-modal data to pass to the model,
     if the model supports it.
+    """
+
+    multi_modal_hash: NotRequired["MultiModalHashDict"]
+    """
+    Optional pre-computed hash for multi-modal data.
     """
 
     mm_processor_kwargs: NotRequired[dict[str, Any]]
@@ -49,6 +55,11 @@ class TokensPrompt(TypedDict):
     """
     Optional multi-modal data to pass to the model,
     if the model supports it.
+    """
+
+    multi_modal_hash: NotRequired["MultiModalHashDict"]
+    """
+    Optional pre-computed hash for multi-modal data.
     """
 
     mm_processor_kwargs: NotRequired[dict[str, Any]]
