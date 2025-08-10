@@ -1277,7 +1277,6 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         tokenization_kwargs: Mapping[str, object],
         *,
         enable_hf_prompt_update: bool,
-        multi_modal_hashes: Optional[MultiModalHashes] = None,
     ) -> tuple[list[int], "BatchFeature", bool]:
         """
         Apply the HF processor on the prompt text and multi-modal data.
@@ -1391,7 +1390,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         tokenization_kwargs: Mapping[str, object],
         *,
         return_mm_hashes: bool,
-        multi_modal_hashes: Optional[MultiModalHashes] = None,
+        precomputed_mm_hashes: Optional[MultiModalHashes] = None,
     ) -> tuple[list[int], MultiModalKwargs, Optional[MultiModalHashes], bool]:
         (
             prompt_ids,
@@ -1411,8 +1410,8 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
                                        hf_processor_mm_kwargs),
         )
 
-        if multi_modal_hashes is not None:
-            mm_hashes = multi_modal_hashes if return_mm_hashes else None
+        if precomputed_mm_hashes is not None:
+            mm_hashes = precomputed_mm_hashes if return_mm_hashes else None
         else:
             mm_hashes = (self._hash_mm_items(
                 mm_data_items, hf_processor_mm_kwargs, tokenization_kwargs)
@@ -1428,7 +1427,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         tokenization_kwargs: Mapping[str, object],
         *,
         return_mm_hashes: bool,
-        multi_modal_hashes: Optional[MultiModalHashes] = None,
+        precomputed_mm_hashes: Optional[MultiModalHashes] = None,
     ) -> tuple[list[int], MultiModalKwargs, Optional[MultiModalHashes], bool]:
         """
         Apply the HF processor on the full prompt text,
@@ -1444,11 +1443,11 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
                 hf_processor_mm_kwargs=hf_processor_mm_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
                 return_mm_hashes=return_mm_hashes,
-                multi_modal_hashes=multi_modal_hashes,
+                precomputed_mm_hashes=precomputed_mm_hashes,
             )
 
-        if multi_modal_hashes is not None:
-            mm_hashes = multi_modal_hashes
+        if precomputed_mm_hashes is not None:
+            mm_hashes = precomputed_mm_hashes
         else:
             mm_hashes = self._hash_mm_items(mm_data_items,
                                             hf_processor_mm_kwargs,
@@ -1477,7 +1476,6 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             hf_processor_mm_kwargs=hf_processor_mm_kwargs,
             tokenization_kwargs=tokenization_kwargs,
             enable_hf_prompt_update=False,
-            multi_modal_hashes=sub_multi_modal_hashes,
         )
 
         mm_missing_kwargs = MultiModalKwargs.from_hf_inputs(
@@ -1729,7 +1727,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             hf_processor_mm_kwargs,
             tokenization_kwargs=tokenization_kwargs,
             return_mm_hashes=return_mm_hashes,
-            multi_modal_hashes=multi_modal_hashes,
+            precomputed_mm_hashes=multi_modal_hashes,
         )
 
         # NOTE: tokenization_kwargs are not required to init processor
