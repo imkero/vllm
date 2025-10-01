@@ -65,10 +65,13 @@ from vllm.model_executor.models.qwen2_audio import (
 )
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import MultiModalKwargs, NestedTensors
+from vllm.multimodal.inputs import (MultiModalKwargsItems,
+                                    MultiModalKwargsOptionalItems,
+                                    NestedTensors)
 from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
 from vllm.multimodal.processing import (
     BaseMultiModalProcessor,
+    MultiModalPromptUpdates,
     PlaceholderFeaturesInfo,
     PromptReplacement,
     PromptUpdate,
@@ -652,54 +655,42 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
     def _maybe_apply_prompt_updates(
         self,
         mm_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
         prompt_ids: list[int],
-        mm_kwargs: MultiModalKwargs,
+        mm_kwargs: MultiModalKwargsOptionalItems,
+        mm_prompt_updates: MultiModalPromptUpdates,
         is_update_applied: bool,
     ) -> tuple[list[int], str, Mapping[str, list[PlaceholderFeaturesInfo]]]:
-        """
-        Qwen3-Omni reimplements this function to handle `use_audio_in_video`.
-        """
-        unbound_prompt_updates = self._get_prompt_updates(
-            mm_items,
-            hf_processor_mm_kwargs,
-            mm_kwargs,
-        )
-        mm_prompt_updates = self._bind_and_group_updates(
-            unbound_prompt_updates)
+        """Handle prompt updates while supporting ``use_audio_in_video``."""
 
         mm_item_counts = mm_items.get_all_counts()
         self._validate_mm_kwargs(mm_kwargs, mm_item_counts)
 
-        use_audio_in_video = hf_processor_mm_kwargs.get(
-            "use_audio_in_video", False)
+        use_audio_in_video = False
+        if "video" in mm_kwargs:
+            video_kwargs = [item for item in mm_kwargs["video"] if item is not None]
+            if video_kwargs:
+                use_audio_in_video = all(
+                    "use_audio_in_video" in item
+                    and bool(item["use_audio_in_video"].data)
+                    for item in video_kwargs)
 
-        if use_audio_in_video:
-            if "video" in mm_item_counts:
-                assert "audio" in mm_item_counts
-                mm_item_counts["audio"] -= mm_item_counts["video"]
+        placeholder_counts = dict(mm_item_counts)
+        if use_audio_in_video and "video" in placeholder_counts:
+            assert "audio" in placeholder_counts
+            placeholder_counts["audio"] -= placeholder_counts["video"]
 
         if is_update_applied:
             prompt_ids = self._get_raw_input_ids(prompt_ids, use_audio_in_video)
 
-        (
-            prompt_ids,
-            prompt,
-            mm_placeholders,
-        ) = self._apply_prompt_updates(
+        prompt_ids, prompt, mm_placeholders = self._apply_prompt_updates(
             prompt_ids,
             mm_prompt_updates,
-            mm_item_counts,
         )
-        self._validate_mm_placeholders(
-            mm_placeholders,
-            mm_item_counts)
+
+        self._validate_mm_placeholders(mm_placeholders, placeholder_counts)
 
         tokenizer = self.info.get_tokenizer()
         prompt = decode_tokens(tokenizer, prompt_ids)
-
-        if use_audio_in_video:
-            mm_kwargs["use_audio_in_video"] = True
 
         return prompt_ids, prompt, mm_placeholders
 
@@ -707,7 +698,7 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         self,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, Any],
-        out_mm_kwargs: MultiModalKwargs,
+        out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         tokenizer = self.info.get_tokenizer()
@@ -722,8 +713,9 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
         image_token_id = vocab[image_token]
         video_token_id = vocab[video_token]
 
-        audio_feature_lengths = out_mm_kwargs.get("audio_feature_lengths")
-        feature_attention_mask = out_mm_kwargs.get("feature_attention_mask")
+        out_mm_data = out_mm_kwargs.get_data()
+        audio_feature_lengths = out_mm_data.get("audio_feature_lengths")
+        feature_attention_mask = out_mm_data.get("feature_attention_mask")
         if audio_feature_lengths is None and feature_attention_mask is None:
             audio_output_lengths = []
         elif audio_feature_lengths is not None:
@@ -757,7 +749,7 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
             return [audio_token_id] * num_features
 
         def get_replacement_qwen2_vision(item_idx: int, modality: str):
-            grid_thw = out_mm_kwargs[f"{modality}_grid_thw"][item_idx]
+            grid_thw = out_mm_data[f"{modality}_grid_thw"][item_idx]
             assert isinstance(grid_thw, torch.Tensor)
             merge_length = image_processor.merge_size**2
 
@@ -772,7 +764,7 @@ class Qwen3OmniMoeThinkerMultiModalProcessor(
             nonlocal audio_in_video_item_idx
             audio_num_features = audio_output_lengths[audio_item_idx +
                                                       item_idx]
-            video_grid_thw = out_mm_kwargs["video_grid_thw"][item_idx]
+            video_grid_thw = out_mm_data["video_grid_thw"][item_idx]
 
             audio_in_video_item_idx += 1
 

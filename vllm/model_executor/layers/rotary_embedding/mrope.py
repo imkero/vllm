@@ -1557,40 +1557,48 @@ class MRotaryEmbedding(RotaryEmbedding):
         video_grid_thw: Union[list[int], torch.Tensor],
         video_second_per_grid_t: float,
     ) -> list[int]:
-        shift = 0
+        if isinstance(video_grid_thw, torch.Tensor):
+            video_grid = video_grid_thw.tolist()
+        else:
+            video_grid = list(video_grid_thw)
+
+        grid_t, grid_h, grid_w = (int(dim) for dim in video_grid)
+        spatial_merge_size = thinker_config.vision_config.spatial_merge_size
+        tokens_per_frame = 0
+        if grid_h > 0 and grid_w > 0 and spatial_merge_size > 0:
+            tokens_per_frame = (grid_h * grid_w) // (spatial_merge_size**2)
+
         audio_token_id = thinker_config.audio_token_id
         video_token_id = thinker_config.video_token_id
         audio_start_token_id = thinker_config.audio_start_token_id
         audio_end_token_id = thinker_config.audio_end_token_id
-        spatial_merge_size = thinker_config.vision_config.spatial_merge_size
         position_id_per_seconds = thinker_config.position_id_per_seconds
-        audio_token_indices = np.arange(next(iter([audio_len])))
-        curr_video_grid_thw = next(iter([video_grid_thw]))
-        height = curr_video_grid_thw[1] // spatial_merge_size
-        width = curr_video_grid_thw[2] // spatial_merge_size
-        video_token_indices = np.arange(curr_video_grid_thw[0]).reshape(-1, 1, 1)
-        video_token_indices = np.broadcast_to(
-            video_token_indices, (video_token_indices.shape[0], height, width)
-        ).reshape(-1)
-        video_token_indices = ((video_token_indices + shift) * next(iter([video_second_per_grid_t])) * position_id_per_seconds)
-        video_data_index, audio_data_index = 0, 0
-        updates = [audio_start_token_id]
-        while video_data_index < len(video_token_indices) and audio_data_index < len(
-            audio_token_indices
-        ):
-            if video_token_indices[video_data_index] <= audio_token_indices[audio_data_index]:
-                updates += [video_token_id]
-                video_data_index += 1
+
+        video_positions: list[float] = []
+        if tokens_per_frame > 0:
+            step = float(video_second_per_grid_t) * float(position_id_per_seconds)
+            for frame_idx in range(grid_t):
+                base = frame_idx * step
+                video_positions.extend([base] * tokens_per_frame)
+
+        audio_positions = list(range(max(audio_len, 0)))
+
+        video_index = 0
+        audio_index = 0
+        updates: list[int] = [audio_start_token_id]
+
+        while video_index < len(video_positions) and audio_index < len(audio_positions):
+            if video_positions[video_index] <= audio_positions[audio_index]:
+                updates.append(video_token_id)
+                video_index += 1
             else:
-                updates += [audio_token_id]
-                audio_data_index += 1
-        if video_data_index < len(video_token_indices):
-            updates += [video_token_id] * (
-                len(video_token_indices) - video_data_index
-            )
-        if audio_data_index < len(audio_token_indices):
-            updates += [audio_token_id] * (
-                len(audio_token_indices) - audio_data_index
-            )
-        updates += [audio_end_token_id]
+                updates.append(audio_token_id)
+                audio_index += 1
+
+        if video_index < len(video_positions):
+            updates.extend([video_token_id] * (len(video_positions) - video_index))
+        if audio_index < len(audio_positions):
+            updates.extend([audio_token_id] * (len(audio_positions) - audio_index))
+
+        updates.append(audio_end_token_id)
         return updates
