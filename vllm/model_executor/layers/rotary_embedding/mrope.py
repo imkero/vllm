@@ -1382,6 +1382,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
                     bos_len = 1
                     llm_pos_ids_list.append(torch.arange(bos_len).view(1, -1).expand(3, -1) + st_idx)
+                    st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
                     llm_pos_ids_list.append(torch.arange(bos_len).view(1, -1).expand(3, -1) + st_idx)
                     st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
                     audio_len = _get_feat_extract_output_lengths(audio_seqlens[audio_idx])
@@ -1418,6 +1419,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
                     eos_len = 1
                     llm_pos_ids_list.append(torch.arange(eos_len).view(1, -1).expand(3, -1) + st_idx)
+                    st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
                     llm_pos_ids_list.append(torch.arange(eos_len).view(1, -1).expand(3, -1) + st_idx)
                     st += text_len + bos_len * 2 + audio_len + video_len + eos_len * 2
                     audio_idx += 1
