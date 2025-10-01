@@ -25,7 +25,6 @@ from collections.abc import Iterable, Mapping, Sequence
 from functools import partial
 from typing import Any, Callable, List, Optional, Set, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,17 +40,10 @@ from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
 )
 from transformers.models.whisper import WhisperFeatureExtractor
 
-from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
-from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen2_audio import (
     Qwen2AudioInputs,
     Qwen2AudioProcessingInfo,
@@ -59,17 +51,14 @@ from vllm.model_executor.models.qwen2_audio import (
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (MultiModalKwargsItems,
-                                    MultiModalKwargsOptionalItems,
-                                    NestedTensors)
+                                    MultiModalKwargsOptionalItems)
 from vllm.multimodal.parse import AudioProcessorItems, MultiModalDataItems
 from vllm.multimodal.processing import (
-    BaseMultiModalProcessor,
     MultiModalPromptUpdates,
     PlaceholderFeaturesInfo,
     PromptReplacement,
     PromptUpdate,
 )
-from vllm.platforms import _Backend
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.tokenizer import decode_tokens
 
@@ -93,12 +82,10 @@ from .utils import (
     WeightsMapper,
     _merge_multimodal_embeddings,
     maybe_prefix,
-    merge_multimodal_embeddings,
 )
 from .qwen3_vl import (
     Qwen3_VisionTransformer,
 )
-from .vision import get_vit_attn_backend
 
 try:
     import flash_attn
