@@ -87,20 +87,23 @@ from .qwen2_5_omni_thinker import (
 )
 from .qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerMultiModalProcessor,
-    Qwen2_5OmniThinkerProcessingInfo,
 )
 from .qwen2_5_vl import (
-    Qwen2_5_VisionAttention,
-    Qwen2_5_VisionRotaryEmbedding,
     Qwen2_5_VLProcessingInfo,
 )
-from .qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
+from .qwen3_moe import (
+    Qwen3MoeLLMForCausalLM,
+    Qwen3MoeLLMModel,
+)
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
     maybe_prefix,
     merge_multimodal_embeddings,
+)
+from .qwen3_vl import (
+    Qwen3_VisionTransformer,
 )
 from .vision import get_vit_attn_backend
 
@@ -110,482 +113,6 @@ except (ImportError, ModuleNotFoundError):
     flash_attn = None
 
 logger = init_logger(__name__)
-
-class Qwen3_VisionPatchEmbed(nn.Module):
-
-    def __init__(
-        self,
-        patch_size: int = 14,
-        temporal_patch_size: int = 2,
-        in_channels: int = 3,
-        hidden_size: int = 1152,
-    ) -> None:
-        super().__init__()
-        self.patch_size = patch_size
-        self.temporal_patch_size = temporal_patch_size
-        self.hidden_size = hidden_size
-
-        kernel_size = (temporal_patch_size, patch_size, patch_size)
-        self.proj = nn.Conv3d(in_channels,
-                              hidden_size,
-                              kernel_size=kernel_size,
-                              stride=kernel_size,
-                              bias=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        L, C = x.shape
-        x = x.view(L, -1, self.temporal_patch_size, self.patch_size,
-                   self.patch_size)
-        x = self.proj(x).view(L, self.hidden_size)
-        return x
-
-class Qwen3_VisionMLP(nn.Module):
-
-    def __init__(self,
-                 in_features: int,
-                 hidden_features: int,
-                 bias: bool = False,
-                 act_fn: Callable[[torch.Tensor], torch.Tensor] = F.silu,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
-        super().__init__()
-        self.linear_fc1 = ColumnParallelLinear(in_features,
-                                              hidden_features,
-                                              bias=bias,
-                                              quant_config=quant_config,
-                                              return_bias=False,
-                                              prefix=f"{prefix}.linear_fc1")
-        self.linear_fc2 = RowParallelLinear(hidden_features,
-                                           in_features,
-                                           bias=bias,
-                                           quant_config=quant_config,
-                                           return_bias=False,
-                                           prefix=f"{prefix}.linear_fc2")
-        self.act_fn = act_fn
-
-    def forward(self, x: torch.Tensor):
-        mlp_output = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-        return mlp_output
-
-
-class Qwen3_VisionBlock(nn.Module):
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        mlp_hidden_dim: int,
-        act_fn: Callable[[torch.Tensor], torch.Tensor] = F.silu,
-        norm_layer: Optional[Callable[[int], nn.Module]] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.norm1 = norm_layer(dim)
-        self.norm2 = norm_layer(dim)
-        self.attn = Qwen2_5_VisionAttention(embed_dim=dim,
-                                            num_heads=num_heads,
-                                            projection_size=dim,
-                                            quant_config=quant_config,
-                                            prefix=f"{prefix}.attn")
-        self.mlp = Qwen3_VisionMLP(dim,
-                                     mlp_hidden_dim,
-                                     act_fn=act_fn,
-                                     bias=True,
-                                     quant_config=quant_config,
-                                     prefix=f"{prefix}.mlp")
-
-    def forward(
-            self,
-            x: torch.Tensor,
-            cu_seqlens: torch.Tensor,
-            rotary_pos_emb: torch.Tensor,
-            max_seqlen: Optional[int] = None,  # Only used for Flash Attention
-            seqlens: Optional[list[int]] = None,  # Only used for xFormers
-    ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x),
-                          cu_seqlens=cu_seqlens,
-                          rotary_pos_emb=rotary_pos_emb,
-                          max_seqlen=max_seqlen,
-                          seqlens=seqlens)
-
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class Qwen3_VisionPatchMerger(nn.Module):
-
-    def __init__(
-        self,
-        d_model: int,
-        context_dim: int,
-        norm_layer: Optional[Callable[[int], nn.Module]] = None,
-        spatial_merge_size: int = 2,
-        use_postshuffle_norm: bool = False,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.hidden_size = context_dim * (spatial_merge_size**2)
-
-        self.use_postshuffle_norm = use_postshuffle_norm
-        if self.use_postshuffle_norm:
-            context_dim = self.hidden_size
-
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.use_postshuffle_norm = use_postshuffle_norm
-        self.ln_q = norm_layer(self.hidden_size if use_postshuffle_norm else context_dim)
-        self.mlp = nn.ModuleList([
-            ColumnParallelLinear(self.hidden_size,
-                                 self.hidden_size,
-                                 bias=True,
-                                 quant_config=quant_config,
-                                 prefix=f"{prefix}.mlp.0"),
-            nn.GELU(),
-            RowParallelLinear(self.hidden_size,
-                              d_model,
-                              bias=True,
-                              quant_config=quant_config,
-                              prefix=f"{prefix}.mlp.2"),
-        ])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_postshuffle_norm:
-            x = self.ln_q(x.view(-1, self.hidden_size))
-        else:
-            x = self.ln_q(x).view(-1, self.hidden_size)
-
-        mlp_fc1, mlp_act, mlp_fc2 = self.mlp
-        x_parallel, _ = mlp_fc1(x)
-        x_parallel = mlp_act(x_parallel)
-        out, _ = mlp_fc2(x_parallel)
-        return out
-
-
-class Qwen3_VisionTransformer(nn.Module):
-
-    def __init__(
-        self,
-        vision_config,
-        norm_eps: float = 1e-6,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        use_data_parallel: bool = False,
-    ) -> None:
-        super().__init__()
-        self.hidden_size = vision_config.hidden_size
-        self.num_heads = vision_config.num_heads
-        self.image_size = vision_config.image_size
-        self.patch_size = vision_config.patch_size
-        self.spatial_merge_size = vision_config.spatial_merge_size
-        self.spatial_merge_unit = self.spatial_merge_size**2
-        self.temporal_patch_size = vision_config.temporal_patch_size
-        self.apply_vit_abs_pos_embed = vision_config.apply_vit_abs_pos_embed
-        self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
-
-        self.patch_embed = Qwen3_VisionPatchEmbed(
-            patch_size=self.patch_size,
-            temporal_patch_size=self.temporal_patch_size,
-            in_channels=vision_config.in_channels,
-            hidden_size=self.hidden_size,
-        )
-
-        # vit pos embeding, TODO: spatial_patch_size vs patch_size
-        if self.apply_vit_abs_pos_embed:
-            self.pos_embed = nn.Embedding((self.image_size // self.patch_size) ** 2, self.hidden_size)
-        else:
-            self.pos_embed = nn.Parameter(torch.empty([1, (self.image_size // self.patch_size) ** 2, self.hidden_size]))
-
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        head_dim = self.hidden_size // self.num_heads
-        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
-
-        self.blocks = nn.ModuleList([
-            Qwen3_VisionBlock(
-                dim=self.hidden_size,
-                num_heads=self.num_heads,
-                mlp_hidden_dim=vision_config.intermediate_size,
-                act_fn=_ACTIVATION_REGISTRY[vision_config.hidden_act],
-                norm_layer=norm_layer,
-                quant_config=quant_config,
-                prefix=f"{prefix}.blocks.{layer_idx}")
-            for layer_idx in range(vision_config.depth)
-        ])
-        self.merger = Qwen3_VisionPatchMerger(
-            d_model=vision_config.out_hidden_size,
-            context_dim=self.hidden_size,
-            norm_layer=norm_layer,
-            spatial_merge_size=self.spatial_merge_size,
-            quant_config=quant_config,
-            prefix=f"{prefix}.merger",
-        )
-        if self.deepstack_visual_indexes is not None:
-            self.merger_list = nn.ModuleList([
-                Qwen3_VisionPatchMerger(
-                    d_model=vision_config.out_hidden_size,
-                    context_dim=self.hidden_size,
-                    spatial_merge_size=self.spatial_merge_size,
-                    use_postshuffle_norm=True,
-                    norm_layer=norm_layer,
-                    quant_config=quant_config,
-                    prefix=f"{prefix}.merger_list.{layer_idx}"
-                ) for layer_idx in range(len(self.deepstack_visual_indexes))
-            ])
-        
-        self.use_data_parallel = use_data_parallel
-        self.attn_backend: _Backend = get_vit_attn_backend(support_fa=True)
-
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.patch_embed.proj.weight.dtype
-
-    @property
-    def device(self) -> torch.device:
-        return self.patch_embed.proj.weight.device
-
-    def rot_pos_emb(self, grid_thw):
-        pos_ids = []
-        for t, h, w in grid_thw:
-            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
-            hpos_ids = hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            hpos_ids = hpos_ids.permute(0, 2, 1, 3)
-            hpos_ids = hpos_ids.flatten()
-
-            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
-            wpos_ids = wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
-            )
-            wpos_ids = wpos_ids.permute(0, 2, 1, 3)
-            wpos_ids = wpos_ids.flatten()
-            pos_ids.append(torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
-        pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
-        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
-        rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
-        return rotary_pos_emb
-
-    def fast_pos_embed_interpolate(self, grid_thw):
-        num_grid_per_side = self.image_size // self.patch_size
-
-        idx_list = [[] for _ in range(4)]
-        weight_list = [[] for _ in range(4)]
-
-        # TODO: use torch instand of np
-        for t, h, w in grid_thw:
-            h_idxs = np.linspace(0, num_grid_per_side-1, h)
-            w_idxs = np.linspace(0, num_grid_per_side-1, w)
-
-            h_idxs_floor = h_idxs.astype(int)
-            w_idxs_floor = w_idxs.astype(int)
-            h_idxs_ceil = (h_idxs.astype(int) + 1).clip(max=num_grid_per_side-1)
-            w_idxs_ceil = (w_idxs.astype(int) + 1).clip(max=num_grid_per_side-1)
-
-            dh = h_idxs - h_idxs_floor
-            dw = w_idxs - w_idxs_floor
-
-            idx_list[0].extend(((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_floor[None]).flatten().tolist() * t)
-            idx_list[1].extend(((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_ceil[None]).flatten().tolist()  * t)
-            idx_list[2].extend(((h_idxs_ceil  * num_grid_per_side)[None].T + w_idxs_floor[None]).flatten().tolist() * t)
-            idx_list[3].extend(((h_idxs_ceil  * num_grid_per_side)[None].T + w_idxs_ceil[None]).flatten().tolist()  * t)
-
-            weight_list[0].extend(((1-dh)[None].T * (1-dw)[None]).flatten().tolist() * t)
-            weight_list[1].extend(((1-dh)[None].T *   dw[None]  ).flatten().tolist() * t)
-            weight_list[2].extend((  dh[None].T   * (1-dw)[None]).flatten().tolist() * t)
-            weight_list[3].extend((  dh[None].T   *   dw[None]  ).flatten().tolist() * t)
-
-        device = self.pos_embed.weight.device
-        dtype = self.pos_embed.weight.dtype
-
-        p0 = self.pos_embed(torch.tensor(idx_list[0], dtype=torch.long, device=device)) * torch.tensor(weight_list[0], dtype=dtype, device=device)[:, None]
-        p1 = self.pos_embed(torch.tensor(idx_list[1], dtype=torch.long, device=device)) * torch.tensor(weight_list[1], dtype=dtype, device=device)[:, None]
-        p2 = self.pos_embed(torch.tensor(idx_list[2], dtype=torch.long, device=device)) * torch.tensor(weight_list[2], dtype=dtype, device=device)[:, None]
-        p3 = self.pos_embed(torch.tensor(idx_list[3], dtype=torch.long, device=device)) * torch.tensor(weight_list[3], dtype=dtype, device=device)[:, None]
-
-        patch_pos_embeds = p0 + p1 + p2 + p3
-        patch_pos_embeds = patch_pos_embeds.split([t*h*w for t, h, w in grid_thw])
-        patch_pos_embeds_permute = []
-        m_size = self.spatial_merge_size
-        for pos_embed, (t, h, w) in zip(patch_pos_embeds, grid_thw):
-            pos_embed = pos_embed.view(t, h // m_size, m_size , w // m_size, m_size, -1).permute(0, 1, 3, 2, 4, 5).flatten(0, 4)
-            patch_pos_embeds_permute.append(pos_embed)
-        patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
-        return patch_pos_embeds
-    
-    def compute_attn_mask_seqlen(
-        self,
-        cu_seqlens: torch.Tensor,
-    ) -> tuple[Optional[int], Optional[list[int]]]:
-        max_seqlen, seqlens = None, None
-        if self.attn_backend == _Backend.FLASH_ATTN:
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-        elif self.attn_backend == _Backend.XFORMERS:
-            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        return max_seqlen, seqlens
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        grid_thw: list[list[int]],
-    ) -> torch.Tensor:
-        hidden_states = x.to(device=self.device, dtype=self.dtype)
-        hidden_states = self.patch_embed(hidden_states)
-
-        if self.apply_vit_abs_pos_embed:
-            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-            hidden_states = hidden_states + pos_embeds
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-
-        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
-            dim=0,
-            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
-        )
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-
-        hidden_states = hidden_states.unsqueeze(1)
-        rotary_pos_emb = rotary_pos_emb.to(hidden_states.device)
-        max_seqlen, seqlens = self.compute_attn_mask_seqlen(cu_seqlens)
-
-        hidden_states_list = []
-        deepstack_visual_indexes = self.deepstack_visual_indexes
-
-        for layer_num, blk in enumerate(self.blocks):
-            hidden_states = blk(hidden_states, 
-                                cu_seqlens=cu_seqlens, 
-                                rotary_pos_emb=rotary_pos_emb,
-                                max_seqlen=max_seqlen,
-                                seqlens=seqlens
-                            )
-            if deepstack_visual_indexes is not None and layer_num in deepstack_visual_indexes:
-                hidden_states_list.append(hidden_states)
-
-        hidden_states = self.merger(hidden_states)
-
-        # processing deepstack
-        if deepstack_visual_indexes is not None:
-            processed_hidden_states_list = [hidden_states]
-            for idx, x in enumerate(hidden_states_list):
-                x = self.merger_list[idx](x)
-                processed_hidden_states_list.append(x)
-            # we cat the original visual features and deepstack features along the feature dim
-            hidden_states = torch.cat(processed_hidden_states_list, dim=1) # [seq_len, hidden_size * (1 + depth_of_deepstack)]
-
-        return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str,
-                                                   torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("attn.qkv.", "attn.q.", "q"),
-            ("attn.qkv.", "attn.k.", "k"),
-            ("attn.qkv.", "attn.v.", "v"),
-        ]
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
-
-
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        "positions": -1,
-        "intermediate_tensors": 0,
-        "inputs_embeds": 0,
-    })
-class Qwen3MoeLLMModel(Qwen3MoeModel):
-
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        deepstack_input_embeds: Optional[IntermediateTensors] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
-            else:
-                hidden_states = self.get_input_embeddings(input_ids)
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-        for layer_idx, layer in enumerate(
-                self.layers[self.start_layer:self.end_layer]):
-            layer_idx = layer_idx + self.start_layer
-
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                residual,
-            )
-
-            if (deepstack_input_embeds is not None
-                    and layer_idx in range(0, len(deepstack_input_embeds))):
-                hidden_states = hidden_states + deepstack_input_embeds[
-                    f"deepstack_input_embeds_{layer_idx}"]
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors({
-                "hidden_states": hidden_states,
-                "residual": residual
-            })
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
-
-
-class Qwen3MoeLLMForCausalLM(Qwen3MoeForCausalLM):
-
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super(Qwen3MoeForCausalLM, self).__init__()
-        text_config = vllm_config.model_config.hf_config.text_config
-        self.config = text_config
-        self.quant_config = vllm_config.quant_config
-        self.model = Qwen3MoeLLMModel(
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "model"),
-        )
-        self.lm_head = ParallelLMHead(
-            text_config.vocab_size,
-            text_config.hidden_size,
-            quant_config=self.quant_config,
-        )
-        if self.config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
-        self.logits_processor = LogitsProcessor(text_config.vocab_size)
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors)
 
 class Qwen3OmniMoeThinkerProcessingInfo(
     Qwen2AudioProcessingInfo,
@@ -636,8 +163,6 @@ class Qwen3OmniMoeThinkerProcessingInfo(
 
     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
         return {"audio": None, "image": None, "video": None}
-
-
 
 
 class Qwen3OmniMoeThinkerMultiModalProcessor(
@@ -1040,8 +565,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         else:
             self.deepstack_input_embeds = None
 
-        self.input_embeds_multiscale = None
-
     def _get_deepstack_input_embeds(self,
                                     num_tokens: int) -> Optional[IntermediateTensors]:
         if not self.use_deepstack or self.deepstack_input_embeds is None:
@@ -1241,114 +764,25 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         return inputs_embeds
 
-    def get_multimodal_embeddings_v0(
-        self, **kwargs: object
-    ) -> Optional[NestedTensors]:
-        audio_input = self._parse_and_validate_audio_input(**kwargs)
-        image_input = self._parse_and_validate_image_input(**kwargs)
-        video_input = self._parse_and_validate_video_input(**kwargs)
-
-        if audio_input is None and image_input is None and video_input is None:
-            return None
-
-        multimodal_embeddings: List[Tuple[NestedTensors, str]] = []
-
-        if audio_input is not None:
-            audio_embeds = self._process_audio_input(audio_input)
-            multimodal_embeddings.append((audio_embeds, "audio"))
-        if image_input is not None:
-            image_embeds = self._process_image_input(image_input)
-            multimodal_embeddings.append((image_embeds, "image"))
-        if video_input is not None:
-            video_embeds = self._process_video_input(video_input)
-            multimodal_embeddings.append((video_embeds, "video"))
-        return multimodal_embeddings
-
-    def get_input_embeddings_v0(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: Optional[NestedTensors] = None,
-    ) -> torch.Tensor:
-        inputs_embeds = self.language_model.get_input_embeddings(input_ids)
-
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            return inputs_embeds, None
-
-        use_deepstack = (
-            self.visual is not None
-            and self.visual.deepstack_visual_indexes is not None
-        )
-        if use_deepstack:
-            multiscale_len = len(self.visual.deepstack_visual_indexes)
-            visual_dim = inputs_embeds.shape[-1]
-            input_embeds_multiscale = None
-            for embeddings, modality in multimodal_embeddings:
-                if modality in ["image", "video"]:
-                    input_embeds_multiscale = torch.zeros_like(inputs_embeds).unsqueeze(1).repeat(1, len(self.visual.deepstack_visual_indexes), 1).flatten(1)
-                    break
-
-        for embeddings, modality in multimodal_embeddings:
-            if modality == "audio":
-                placeholder_token_id = self.config.audio_token_id
-            if modality == "image":
-                placeholder_token_id = self.config.image_token_id
-            if modality == "video":
-                placeholder_token_id = self.config.video_token_id
-            if use_deepstack and modality in ["image", "video"]:
-                embeddings = torch.cat(embeddings)
-                embeddings, embeddings_multiscale = embeddings.split([visual_dim, visual_dim * multiscale_len], dim=-1)
-                input_embeds_multiscale = merge_multimodal_embeddings(
-                    input_ids,
-                    input_embeds_multiscale,
-                    embeddings_multiscale,
-                    placeholder_token_id=placeholder_token_id,
-                )
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids, inputs_embeds, embeddings, placeholder_token_id
-            )
-
-        if use_deepstack and input_embeds_multiscale is not None:
-            input_embeds_multiscale = input_embeds_multiscale.view(
-                inputs_embeds.shape[0], multiscale_len, visual_dim
-            ).permute(1, 0, 2).contiguous()
-            self._set_deepstack_input_embeds(input_embeds_multiscale)
-            return inputs_embeds, input_embeds_multiscale
-
-        return inputs_embeds, None
-
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        input_embeds_multiscale: Optional[torch.Tensor] = None,
         **kwargs: object,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if intermediate_tensors is not None:
             inputs_embeds = None
 
-        # NOTE: In v1, inputs_embeds is always generated at model runner, this
-        # condition is for v0 compatibility.
-        elif inputs_embeds is None:
-            multimodal_embeddings = self.get_multimodal_embeddings_v0(**kwargs)
-            inputs_embeds, input_embeds_multiscale = self.get_input_embeddings_v0(
-                input_ids, multimodal_embeddings
-            )
-            input_ids = None
-
         deepstack_input_embeds: Optional[IntermediateTensors]
         deepstack_input_embeds = None
-        if input_embeds_multiscale is not None:
-            assert input_embeds_multiscale.shape[-1] == inputs_embeds.shape[-1]
-            deepstack_input_embeds = IntermediateTensors({
-                f"deepstack_input_embeds_{idx}": input_embeds_multiscale[idx]
-                for idx in range(input_embeds_multiscale.size(0))
-            })
-        elif (self.use_deepstack and inputs_embeds is not None
-              and get_pp_group().is_first_rank()):
+        if self.use_deepstack and inputs_embeds is not None and \
+            get_pp_group().is_first_rank:
             deepstack_input_embeds = self._get_deepstack_input_embeds(
                 inputs_embeds.size(0))
+        else:
+            deepstack_input_embeds = None
 
         hidden_states = self.language_model.model(
             input_ids,
