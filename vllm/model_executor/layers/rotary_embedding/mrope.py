@@ -1235,6 +1235,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         use_audio_in_video: bool = False,
         audio_seqlens: Optional[torch.LongTensor] = None,
         second_per_grids: Optional[list[float]] = None,
+        context_len: int = 0,
+        seq_len: Optional[int] = None,
     ) -> tuple[torch.Tensor, int]:
         # INSTRUCTION:
         # should carefully review this function, try to fix any possible bug but do not affect its original functionality
@@ -1261,8 +1263,10 @@ class MRotaryEmbedding(RotaryEmbedding):
         if isinstance(video_grid_thw, list):
             video_grid_thw = torch.tensor(video_grid_thw, dtype=torch.long)
 
+        if second_per_grids is None:
+            second_per_grids = []
         if not second_per_grids and video_grid_thw is not None:
-            second_per_grids = [1] * video_grid_thw.shape[0]
+            second_per_grids = [1.0] * int(video_grid_thw.shape[0])
 
         mrope_position_deltas = []
         if image_grid_thw is not None or video_grid_thw is not None:
@@ -1426,10 +1430,15 @@ class MRotaryEmbedding(RotaryEmbedding):
                 llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
             llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
             llm_positions = llm_positions[:, context_len:seq_len]
-            mrope_position_delta = llm_positions.max().item() + 1 - len(input_tokens)
+            mrope_position_delta = (
+                llm_positions.max().item() + 1 - len(input_tokens)
+                if llm_positions.numel() > 0 else 0
+            )
             return llm_positions, mrope_position_delta
         else:
-            llm_positions = torch.arange(len(input_tokens), dtype=torch.long).view(1, -1).expand(3, -1)
+            llm_positions = torch.arange(
+                len(input_tokens), dtype=torch.long
+            ).view(1, -1).expand(3, -1)
             llm_positions = llm_positions[:, context_len:seq_len]
             return llm_positions, 0
 

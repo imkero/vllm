@@ -269,6 +269,7 @@ class Qwen3_VisionTransformer(nn.Module):
         norm_eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = vision_config.hidden_size
@@ -330,6 +331,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 ) for layer_idx in range(len(self.deepstack_visual_indexes))
             ])
         
+        self.use_data_parallel = use_data_parallel
         self.attn_backend: _Backend = get_vit_attn_backend(support_fa=True)
 
     @property
@@ -514,11 +516,9 @@ class Qwen3_VisionTransformer(nn.Module):
         "inputs_embeds": 0,
     })
 class Qwen3MoeLLMModel(Qwen3MoeModel):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__(vllm_config=vllm_config,
-                         prefix=prefix)
 
-        self.deepstack_multiscale_layer_start = 1
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
 
     def forward(
         self,
@@ -526,8 +526,7 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        # args for deepstack
-        input_embeds_multiscale = None
+        deepstack_input_embeds: Optional[IntermediateTensors] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -539,20 +538,20 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for layer_idx, layer in enumerate(self.layers[self.start_layer:self.end_layer]):
+        for layer_idx, layer in enumerate(
+                self.layers[self.start_layer:self.end_layer]):
             layer_idx = layer_idx + self.start_layer
-
-            # process deepstack
-            if input_embeds_multiscale is not None and \
-                        layer_idx in range(self.deepstack_multiscale_layer_start, self.deepstack_multiscale_layer_start+len(input_embeds_multiscale)):
-                input_embeds_multiscale_this = input_embeds_multiscale[layer_idx - self.deepstack_multiscale_layer_start]
-                hidden_states = hidden_states + input_embeds_multiscale_this
 
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
             )
+
+            if (deepstack_input_embeds is not None
+                    and layer_idx in range(0, len(deepstack_input_embeds))):
+                hidden_states = hidden_states + deepstack_input_embeds[
+                    f"deepstack_input_embeds_{layer_idx}"]
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
@@ -563,21 +562,24 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
 
 
 class Qwen3MoeLLMForCausalLM(Qwen3MoeForCausalLM):
-    
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Qwen3MoeForCausalLM, self).__init__()
-        config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-        self.config = config
-        self.quant_config = quant_config
-        self.model = Qwen3MoeLLMModel(vllm_config=vllm_config,
-                                   prefix=maybe_prefix(prefix, "model"))
-        self.lm_head = ParallelLMHead(config.vocab_size,
-                                      config.hidden_size,
-                                      quant_config=quant_config)
+        text_config = vllm_config.model_config.hf_config.text_config
+        self.config = text_config
+        self.quant_config = vllm_config.quant_config
+        self.model = Qwen3MoeLLMModel(
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+        )
+        self.lm_head = ParallelLMHead(
+            text_config.vocab_size,
+            text_config.hidden_size,
+            quant_config=self.quant_config,
+        )
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = LogitsProcessor(text_config.vocab_size)
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
 
@@ -980,25 +982,96 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
 
         self.audio_tower = Qwen3OmniMoeAudioEncoder(thinker_config.audio_config)
 
-        self.visual = Qwen3_VisionTransformer(
-            vision_config=thinker_config.vision_config,
-            norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "visual"),
-        )
         self.quant_config = quant_config
+        self.use_data_parallel = (
+            multimodal_config.mm_encoder_tp_mode == "data"
+        )
+        if (not multimodal_config.get_limit_per_prompt("image")
+                and not multimodal_config.get_limit_per_prompt("video")):
+            self.visual = None
+        else:
+            self.visual = Qwen3_VisionTransformer(
+                vision_config=thinker_config.vision_config,
+                norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "visual"),
+                use_data_parallel=self.use_data_parallel,
+            )
 
         self.language_model = Qwen3MoeLLMForCausalLM(
-            vllm_config=vllm_config.with_hf_config(thinker_config.text_config,
-                                                   architectures=["Qwen3MoeForCausalLM"]),
-            prefix=maybe_prefix(prefix, "language_model")
+            vllm_config=vllm_config.with_hf_config(
+                thinker_config.text_config,
+                architectures=["Qwen3MoeForCausalLM"],
+            ),
+            prefix=maybe_prefix(prefix, "language_model"),
         )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
 
+        self.use_deepstack = (
+            self.visual is not None
+            and getattr(
+                thinker_config.vision_config, "deepstack_visual_indexes", None
+            )
+            is not None
+        )
+        self.deepstack_num_level = (
+            len(thinker_config.vision_config.deepstack_visual_indexes)
+            if self.use_deepstack
+            else 0
+        )
+        self.visual_dim = thinker_config.vision_config.out_hidden_size
+        self.multiscale_dim = self.visual_dim * self.deepstack_num_level
+        if self.use_deepstack:
+            self.deepstack_input_embeds = [
+                torch.zeros(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    thinker_config.text_config.hidden_size,
+                )
+                for _ in range(self.deepstack_num_level)
+            ]
+        else:
+            self.deepstack_input_embeds = None
+
         self.input_embeds_multiscale = None
+
+    def _get_deepstack_input_embeds(self,
+                                    num_tokens: int) -> Optional[IntermediateTensors]:
+        if not self.use_deepstack or self.deepstack_input_embeds is None:
+            return None
+        return IntermediateTensors({
+            f"deepstack_input_embeds_{idx}":
+            self.deepstack_input_embeds[idx][:num_tokens]
+            for idx in range(self.deepstack_num_level)
+        })
+
+    def _set_deepstack_input_embeds(self,
+                                    deepstack_input_embeds: torch.Tensor) -> None:
+        if not self.use_deepstack or self.deepstack_input_embeds is None:
+            return
+        num_tokens = deepstack_input_embeds.size(1)
+        if num_tokens > self.deepstack_input_embeds[0].size(0):
+            self.deepstack_input_embeds = [
+                torch.zeros(
+                    num_tokens,
+                    self.config.text_config.hidden_size,
+                    device=self.deepstack_input_embeds[0].device,
+                    dtype=self.deepstack_input_embeds[0].dtype,
+                )
+                for _ in range(self.deepstack_num_level)
+            ]
+        for idx in range(self.deepstack_num_level):
+            self.deepstack_input_embeds[idx][:num_tokens].copy_(
+                deepstack_input_embeds[idx])
+
+    def _clear_deepstack_input_embeds(self, num_tokens: int) -> None:
+        if not self.use_deepstack or self.deepstack_input_embeds is None:
+            return
+        if num_tokens > 0:
+            for idx in range(self.deepstack_num_level):
+                self.deepstack_input_embeds[idx][:num_tokens].zero_()
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
         mm_input_by_modality = {}
@@ -1064,14 +1137,16 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self,
         input_ids: torch.Tensor,
         multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
+        *,
+        is_multimodal: Optional[torch.Tensor] = None,
+        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         inputs_embeds = self.language_model.get_input_embeddings(input_ids)
         input_embeds_multiscale = None
         if multimodal_embeddings is not None and len(multimodal_embeddings) != 0:
-            # TODO (ywang96): support overlapping modalitiy embeddings so that
+            # TODO (ywang96): support overlapping modality embeddings so that
             # `use_audio_in_video` will work on V1.
-            # split the feat dim to obtain multi-scale visual feature
-            if self.visual.deepstack_visual_indexes is not None:
+            if self.visual is not None and self.visual.deepstack_visual_indexes is not None:
                 multiscale_len = len(self.visual.deepstack_visual_indexes)
                 multimodal_embeddings_multiscale = []
                 for index, embeddings in enumerate(multimodal_embeddings):
@@ -1084,14 +1159,22 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                         multimodal_embeddings[index] = embeddings_main
                         multimodal_embeddings_multiscale.append(embeddings_multiscale)
                 if len(multimodal_embeddings_multiscale) > 0:
-                    input_embeds_multiscale = inputs_embeds.new_zeros(inputs_embeds.size(0), multiscale_len * inputs_embeds.size(1))
+                    input_embeds_multiscale = inputs_embeds.new_zeros(
+                        inputs_embeds.size(0),
+                        multiscale_len * inputs_embeds.size(1),
+                    )
                     input_embeds_multiscale = merge_multimodal_embeddings(
                         input_ids,
                         input_embeds_multiscale,
                         multimodal_embeddings_multiscale,
-                        placeholder_token_id=[self.config.image_token_id, self.config.video_token_id],
+                        placeholder_token_id=[
+                            self.config.image_token_id,
+                            self.config.video_token_id,
+                        ],
                     )
-                    input_embeds_multiscale = input_embeds_multiscale.view(inputs_embeds.shape[0], multiscale_len, visual_dim).permute(1,0,2).contiguous()
+                    input_embeds_multiscale = input_embeds_multiscale.view(
+                        inputs_embeds.shape[0], multiscale_len, visual_dim
+                    ).permute(1, 0, 2).contiguous()
 
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids,
@@ -1103,7 +1186,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
                     self.config.audio_token_id,
                 ],
             )
-        
+
+        if input_embeds_multiscale is not None:
+            self._set_deepstack_input_embeds(input_embeds_multiscale)
+
         return inputs_embeds, input_embeds_multiscale
 
     def get_multimodal_embeddings_v0(
@@ -1139,7 +1225,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return inputs_embeds, None
 
-        use_deepstack = self.visual.deepstack_visual_indexes is not None
+        use_deepstack = (
+            self.visual is not None
+            and self.visual.deepstack_visual_indexes is not None
+        )
         if use_deepstack:
             multiscale_len = len(self.visual.deepstack_visual_indexes)
             visual_dim = inputs_embeds.shape[-1]
@@ -1170,7 +1259,10 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             )
 
         if use_deepstack and input_embeds_multiscale is not None:
-            input_embeds_multiscale = input_embeds_multiscale.view(inputs_embeds.shape[0], multiscale_len, visual_dim).permute(1,0,2).contiguous()
+            input_embeds_multiscale = input_embeds_multiscale.view(
+                inputs_embeds.shape[0], multiscale_len, visual_dim
+            ).permute(1, 0, 2).contiguous()
+            self._set_deepstack_input_embeds(input_embeds_multiscale)
             return inputs_embeds, input_embeds_multiscale
 
         return inputs_embeds, None
@@ -1196,17 +1288,30 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             )
             input_ids = None
 
+        deepstack_input_embeds: Optional[IntermediateTensors]
+        deepstack_input_embeds = None
         if input_embeds_multiscale is not None:
             assert input_embeds_multiscale.shape[-1] == inputs_embeds.shape[-1]
-            
+            deepstack_input_embeds = IntermediateTensors({
+                f"deepstack_input_embeds_{idx}": input_embeds_multiscale[idx]
+                for idx in range(input_embeds_multiscale.size(0))
+            })
+        elif (self.use_deepstack and inputs_embeds is not None
+              and get_pp_group().is_first_rank()):
+            deepstack_input_embeds = self._get_deepstack_input_embeds(
+                inputs_embeds.size(0))
+
         hidden_states = self.language_model.model(
             input_ids,
             positions,
             intermediate_tensors,
             inputs_embeds=inputs_embeds,
-            # args for deepstack
-            input_embeds_multiscale=input_embeds_multiscale,
+            deepstack_input_embeds=deepstack_input_embeds,
         )
+
+        if (self.use_deepstack and inputs_embeds is not None
+                and get_pp_group().is_first_rank()):
+            self._clear_deepstack_input_embeds(inputs_embeds.size(0))
         return hidden_states
 
     def compute_logits(
