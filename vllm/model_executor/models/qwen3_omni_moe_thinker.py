@@ -1,10 +1,3 @@
-# INSTRUCTION:
-# should carefully modify this file
-# you should strictly follow the impl of `qwen3_vl_moe.py` because they has similar architecture, 
-# and `qwen3_vl_moe.py` is production ready (golden standard) but this file `qwen3_omni_moe_thinker.py` is taken from an outdated PR.
-# for audio modality part, you can refer to `qwen2_5_omni_thinker.py` for more information if needed.
-
-
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 The Qwen team.
 # Copyright 2023 The vLLM team.

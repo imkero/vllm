@@ -435,11 +435,11 @@ class MRotaryEmbedding(RotaryEmbedding):
                 config=hf_config,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
+                context_len=context_len,
+                seq_len=seq_len,
                 use_audio_in_video=use_audio_in_video,
                 audio_seqlens=audio_feature_lengths,
                 second_per_grids=second_per_grid_ts,
-                context_len=context_len,
-                seq_len=seq_len,
             )
         elif hf_config.model_type == "qwen2_5_omni":
             return cls._omni_get_input_positions_tensor(
@@ -1232,16 +1232,12 @@ class MRotaryEmbedding(RotaryEmbedding):
         config: PretrainedConfig,
         image_grid_thw: Union[list[list[int]], torch.Tensor],
         video_grid_thw: Union[list[list[int]], torch.Tensor],
+        context_len: int = 0,
+        seq_len: Optional[int] = None,
         use_audio_in_video: bool = False,
         audio_seqlens: Optional[torch.LongTensor] = None,
         second_per_grids: Optional[list[float]] = None,
-        context_len: int = 0,
-        seq_len: Optional[int] = None,
     ) -> tuple[torch.Tensor, int]:
-        # INSTRUCTION:
-        # should carefully review this function, try to fix any possible bug but do not affect its original functionality
-        # this function is expected to work with cpu tensor only
-        # notice and try to fix if any problem exist, because this function has been modified not so carefully
         def _get_feat_extract_output_lengths(input_lengths: torch.LongTensor):
             input_lengths_leave = input_lengths % 100
             feat_lengths = (input_lengths_leave - 1) // 2 + 1
@@ -1263,10 +1259,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         if isinstance(video_grid_thw, list):
             video_grid_thw = torch.tensor(video_grid_thw, dtype=torch.long)
 
-        if second_per_grids is None:
-            second_per_grids = []
         if not second_per_grids and video_grid_thw is not None:
-            second_per_grids = [1.0] * int(video_grid_thw.shape[0])
+            second_per_grids = [1.0] * video_grid_thw.shape[0]
 
         mrope_position_deltas = []
         if image_grid_thw is not None or video_grid_thw is not None:
@@ -1382,7 +1376,6 @@ class MRotaryEmbedding(RotaryEmbedding):
                     st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
                     bos_len = 1
                     llm_pos_ids_list.append(torch.arange(bos_len).view(1, -1).expand(3, -1) + st_idx)
-                    st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
                     llm_pos_ids_list.append(torch.arange(bos_len).view(1, -1).expand(3, -1) + st_idx)
                     st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
                     audio_len = _get_feat_extract_output_lengths(audio_seqlens[audio_idx])
@@ -1419,7 +1412,6 @@ class MRotaryEmbedding(RotaryEmbedding):
                     st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
                     eos_len = 1
                     llm_pos_ids_list.append(torch.arange(eos_len).view(1, -1).expand(3, -1) + st_idx)
-                    st_idx = llm_pos_ids_list[-1].max().item() + 1 if len(llm_pos_ids_list) > 0 else 0
                     llm_pos_ids_list.append(torch.arange(eos_len).view(1, -1).expand(3, -1) + st_idx)
                     st += text_len + bos_len * 2 + audio_len + video_len + eos_len * 2
                     audio_idx += 1
@@ -1432,15 +1424,10 @@ class MRotaryEmbedding(RotaryEmbedding):
                 llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
             llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
             llm_positions = llm_positions[:, context_len:seq_len]
-            mrope_position_delta = (
-                llm_positions.max().item() + 1 - len(input_tokens)
-                if llm_positions.numel() > 0 else 0
-            )
+            mrope_position_delta = llm_positions.max().item() + 1 - len(input_tokens)
             return llm_positions, mrope_position_delta
         else:
-            llm_positions = torch.arange(
-                len(input_tokens), dtype=torch.long
-            ).view(1, -1).expand(3, -1)
+            llm_positions = torch.arange(len(input_tokens), dtype=torch.long).view(1, -1).expand(3, -1)
             llm_positions = llm_positions[:, context_len:seq_len]
             return llm_positions, 0
 
@@ -1559,48 +1546,40 @@ class MRotaryEmbedding(RotaryEmbedding):
         video_grid_thw: Union[list[int], torch.Tensor],
         video_second_per_grid_t: float,
     ) -> list[int]:
-        if isinstance(video_grid_thw, torch.Tensor):
-            video_grid = video_grid_thw.tolist()
-        else:
-            video_grid = list(video_grid_thw)
-
-        grid_t, grid_h, grid_w = (int(dim) for dim in video_grid)
-        spatial_merge_size = thinker_config.vision_config.spatial_merge_size
-        tokens_per_frame = 0
-        if grid_h > 0 and grid_w > 0 and spatial_merge_size > 0:
-            tokens_per_frame = (grid_h * grid_w) // (spatial_merge_size**2)
-
+        shift = 0
         audio_token_id = thinker_config.audio_token_id
         video_token_id = thinker_config.video_token_id
         audio_start_token_id = thinker_config.audio_start_token_id
         audio_end_token_id = thinker_config.audio_end_token_id
+        spatial_merge_size = thinker_config.vision_config.spatial_merge_size
         position_id_per_seconds = thinker_config.position_id_per_seconds
-
-        video_positions: list[float] = []
-        if tokens_per_frame > 0:
-            step = float(video_second_per_grid_t) * float(position_id_per_seconds)
-            for frame_idx in range(grid_t):
-                base = frame_idx * step
-                video_positions.extend([base] * tokens_per_frame)
-
-        audio_positions = list(range(max(audio_len, 0)))
-
-        video_index = 0
-        audio_index = 0
-        updates: list[int] = [audio_start_token_id]
-
-        while video_index < len(video_positions) and audio_index < len(audio_positions):
-            if video_positions[video_index] <= audio_positions[audio_index]:
-                updates.append(video_token_id)
-                video_index += 1
+        audio_token_indices = np.arange(next(iter([audio_len])))
+        curr_video_grid_thw = next(iter([video_grid_thw]))
+        height = curr_video_grid_thw[1] // spatial_merge_size
+        width = curr_video_grid_thw[2] // spatial_merge_size
+        video_token_indices = np.arange(curr_video_grid_thw[0]).reshape(-1, 1, 1)
+        video_token_indices = np.broadcast_to(
+            video_token_indices, (video_token_indices.shape[0], height, width)
+        ).reshape(-1)
+        video_token_indices = ((video_token_indices + shift) * next(iter([video_second_per_grid_t])) * position_id_per_seconds)
+        video_data_index, audio_data_index = 0, 0
+        updates = [audio_start_token_id]
+        while video_data_index < len(video_token_indices) and audio_data_index < len(
+            audio_token_indices
+        ):
+            if video_token_indices[video_data_index] <= audio_token_indices[audio_data_index]:
+                updates += [video_token_id]
+                video_data_index += 1
             else:
-                updates.append(audio_token_id)
-                audio_index += 1
-
-        if video_index < len(video_positions):
-            updates.extend([video_token_id] * (len(video_positions) - video_index))
-        if audio_index < len(audio_positions):
-            updates.extend([audio_token_id] * (len(audio_positions) - audio_index))
-
-        updates.append(audio_end_token_id)
+                updates += [audio_token_id]
+                audio_data_index += 1
+        if video_data_index < len(video_token_indices):
+            updates += [video_token_id] * (
+                len(video_token_indices) - video_data_index
+            )
+        if audio_data_index < len(audio_token_indices):
+            updates += [audio_token_id] * (
+                len(audio_token_indices) - audio_data_index
+            )
+        updates += [audio_end_token_id]
         return updates
