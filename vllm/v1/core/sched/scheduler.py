@@ -152,8 +152,14 @@ class Scheduler(SchedulerInterface):
         # NOTE: For the models without encoder (e.g., text-only models),
         # the encoder cache will not be initialized because cache size is 0
         # for these models.
+        encoder_cache_tail_size = getattr(
+            self.scheduler_config, "encoder_cache_tail_size", None)
+        encoder_cache_max_item = getattr(
+            self.scheduler_config, "encoder_cache_max_item", None)
         self.encoder_cache_manager = EncoderCacheManager(
-            cache_size=encoder_cache_size)
+            cache_size=encoder_cache_size,
+            tail_size=encoder_cache_tail_size,
+            max_items=encoder_cache_max_item)
 
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
@@ -743,7 +749,7 @@ class Scheduler(SchedulerInterface):
         # multiple encoder inputs per request), we need to create temporary
         # trackers for accounting at the encoder input level.
         mm_hashes_to_schedule = set()
-        num_tokens_to_schedule = 0
+        num_items_to_schedule = 0
         for i, mm_feature in enumerate(mm_features):
             start_pos = mm_feature.mm_position.offset
             num_encoder_tokens = mm_feature.mm_position.length
@@ -782,8 +788,14 @@ class Scheduler(SchedulerInterface):
                     # current step.
                     continue
 
+                needed_start = max(num_computed_tokens - start_pos, 0)
+                needed_end = min(
+                    num_computed_tokens + num_new_tokens - start_pos,
+                    num_encoder_tokens,
+                )
+
                 if self.encoder_cache_manager.check_and_update_cache(
-                        request, i):
+                        request, i, (needed_start, needed_end)):
                     # The encoder input is already computed and cached from a
                     # previous step.
                     continue
@@ -800,7 +812,7 @@ class Scheduler(SchedulerInterface):
 
             if not self.encoder_cache_manager.can_allocate(
                     request, i, encoder_compute_budget,
-                    num_tokens_to_schedule):
+                    num_items_to_schedule):
                 # The encoder cache is full or the encoder budget is exhausted.
                 # NOTE(woosuk): We assume that the encoder input tokens should
                 # be processed altogether, as the encoder usually uses
@@ -816,8 +828,7 @@ class Scheduler(SchedulerInterface):
                     # the request in this step.
                     num_new_tokens = 0
                 break
-
-            num_tokens_to_schedule += num_encoder_tokens
+            num_items_to_schedule += 1
             encoder_compute_budget -= num_encoder_tokens
             mm_hashes_to_schedule.add(request.mm_features[i].identifier)
             encoder_inputs_to_schedule.append(i)

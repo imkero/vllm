@@ -3,7 +3,7 @@
 
 from collections import OrderedDict
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from vllm.logger import init_logger
 from vllm.multimodal import MultiModalRegistry
@@ -40,14 +40,20 @@ class EncoderCacheManager:
     Oldest cached embeddings with no request referenced will be first evicted.
     
     Args:
-        cache_size: Limit the size of the cache, measured by the number of
-                    tokens from the input sequence.
+        cache_size: Historical limit of the cache, measured in tokens. The
+            value is still required for backward compatibility but is no longer
+            used for accounting when `tail_size` or `max_items` are provided.
 
     Attributes:
-        cache_size: Total cache capacity in encoder tokens.
-        num_free_slots: Current available cache capacity in encoder tokens.
+        cache_size: Total cache capacity measured in encoder tokens (legacy).
+        encoder_cache_tail_size: Number of tokens per encoder output retained
+            in the cache (tail length).
+        encoder_cache_max_item: Maximum number of encoder outputs that can be
+            stored simultaneously.
+        num_free_slots: Current available cache capacity measured in encoder
+            outputs.
         num_freeable_slots: Capacity that can be immediately reclaimed by
-            evicting entries with zero references (in encoder tokens).
+            evicting entries with zero references (in encoder outputs).
         cached: Mapping from mm_hash to a set of request IDs that currently
             reference the cached entry. If the set is empty, the entry exists
             but is not referenced by any request and is eligible for
@@ -59,29 +65,62 @@ class EncoderCacheManager:
             last call to get_freed_mm_hashes(). This list is cleared on return.
     """
 
-    def __init__(self, cache_size: int):
+    def __init__(self,
+                 cache_size: int,
+                 *,
+                 tail_size: Optional[int] = None,
+                 max_items: Optional[int] = None):
         self.cache_size = cache_size
-        self.num_free_slots = cache_size
-        self.num_freeable_slots = cache_size
+        self.encoder_cache_tail_size = (
+            cache_size if tail_size is None else max(tail_size, 0))
+        self.encoder_cache_max_item = (
+            cache_size if max_items is None else max(max_items, 0))
+        self.num_free_slots = self.encoder_cache_max_item
+        self.num_freeable_slots = self.encoder_cache_max_item
 
         # mm_hash of mm_data => ids of requests that reference the mm_data
         self.cached: dict[str, set[str]] = {}
 
-        # mm_hash of mm_data => num_encoder_tokens of the mm_data
+        # mm_hash of mm_data => cache slots required for the mm_data
         self.freeable: OrderedDict[str, int] = OrderedDict()
         self.freed: list[str] = []
 
-    def check_and_update_cache(self, request: Request, input_id: int) -> bool:
+    def _is_range_cached(self, request: Request, input_id: int,
+                         needed_range: Optional[Tuple[int, int]]) -> bool:
+        """Return True if the requested range is covered by the cached tail."""
+
+        if needed_range is None:
+            return True
+
+        start, end = needed_range
+        if start >= end:
+            return False
+
+        num_tokens = request.get_num_encoder_tokens(input_id)
+        if num_tokens == 0:
+            return True
+
+        tail_len = min(num_tokens, self.encoder_cache_tail_size)
+        if tail_len == 0:
+            return False
+        tail_start = max(num_tokens - tail_len, 0)
+        return start >= tail_start
+
+    def check_and_update_cache(self,
+                               request: Request,
+                               input_id: int,
+                               needed_range: Optional[Tuple[int, int]] = None
+                               ) -> bool:
         """Check if encoder output for a specific multimodal input is cached.
 
-        If the encoder output is cached, update `cached` to add the request id
-        to the set of request ids that reference the cached encoder output.
-        If the encoder output was previously not referenced by any request,
-        update `freeable` and `num_freeable_slots` accordingly.
-
         Args:
-            request: The request containing the multimodal input
-            input_id: Index of the multimodal input within the request
+            request: The request containing the multimodal input.
+            input_id: Index of the multimodal input within the request.
+            needed_range: Optional tuple representing the [start, end) range
+                (relative to the encoder output) needed by the scheduler in
+                this step. When provided, the method verifies the requested
+                range is within the cached tail. If the range extends beyond
+                the retained tail, the encoder output is treated as uncached.
 
         Returns:
             True if the encoder output for this input is already cached
@@ -91,17 +130,20 @@ class EncoderCacheManager:
         if mm_hash not in self.cached:
             return False
 
+        if not self._is_range_cached(request, input_id, needed_range):
+            return False
+
         # Cached but currently not referenced by any request
         if not self.cached[mm_hash]:
-            num_tokens = self.freeable.pop(mm_hash)
-            self.num_freeable_slots -= num_tokens
+            num_slots = self.freeable.pop(mm_hash, 0)
+            self.num_freeable_slots -= num_slots
 
         self.cached[mm_hash].add(request.request_id)
         return True
 
     def can_allocate(self, request: Request, input_id: int,
                      encoder_compute_budget: int,
-                     num_tokens_to_schedule: int) -> bool:
+                     num_items_to_schedule: int) -> bool:
         """Check if there's sufficient cache space for a multimodal input. 
         If there is, return True and update EncoderCacheManager state.
 
@@ -119,8 +161,8 @@ class EncoderCacheManager:
             input_id: Index of the multimodal input within the request.
             encoder_compute_budget: Number of encoder tokens allowed to be 
                 computed when this method is invoked.
-            num_tokens_to_schedule: Number of tokens already scheduled to be 
-                allocated with cache space when this method is invoked.
+            num_items_to_schedule: Number of encoder outputs already scheduled
+                to be allocated with cache space when this method is invoked.
 
         Returns:
             True if there's enough capacity to hold the encoder output for this
@@ -136,24 +178,24 @@ class EncoderCacheManager:
         if num_tokens > encoder_compute_budget:
             return False
 
-        num_tokens += num_tokens_to_schedule
+        num_slots_needed = 1 + num_items_to_schedule
 
         # Enough free slots
-        if num_tokens <= self.num_free_slots:
+        if num_slots_needed <= self.num_free_slots:
             return True
 
         # Not enough reclaimable slots
-        if num_tokens > self.num_freeable_slots:
+        if num_slots_needed > self.num_freeable_slots:
             return False
 
         # Not enough free slots but enough reclaimable slots
         # NOTE: Eviction takes place here, but physical memory is not freed
         # until model runner is notified by the scheduler output.
-        while num_tokens > self.num_free_slots:
-            mm_hash, num_free_token = self.freeable.popitem(last=False)
+        while num_slots_needed > self.num_free_slots:
+            mm_hash, num_slots = self.freeable.popitem(last=False)
             del self.cached[mm_hash]
             self.freed.append(mm_hash)
-            self.num_free_slots += num_free_token
+            self.num_free_slots += num_slots
         return True
 
     def allocate(self, request: Request, input_id: int) -> None:
@@ -172,16 +214,14 @@ class EncoderCacheManager:
         if mm_hash not in self.cached:
             self.cached[mm_hash] = set()
 
-        num_encoder_tokens = request.get_num_encoder_tokens(input_id)
-
         # NOTE: Encoder cache should always have enough space for encoder inputs
         # that are scheduled since eviction takes place at can_allocate().
-        assert self.num_free_slots >= num_encoder_tokens
-        assert self.num_freeable_slots >= num_encoder_tokens
+        assert self.num_free_slots >= 1
+        assert self.num_freeable_slots >= 1
 
         self.cached[mm_hash].add(request_id)
-        self.num_free_slots -= num_encoder_tokens
-        self.num_freeable_slots -= num_encoder_tokens
+        self.num_free_slots -= 1
+        self.num_freeable_slots -= 1
 
     def get_cached_input_ids(self, request: Request) -> set[int]:
         """Get all cached multimodal input IDs for a request.
@@ -214,9 +254,8 @@ class EncoderCacheManager:
             return
         self.cached[mm_hash].discard(req_id)
         if not self.cached[mm_hash]:
-            num_tokens = request.get_num_encoder_tokens(input_id)
-            self.freeable[mm_hash] = num_tokens
-            self.num_freeable_slots += num_tokens
+            self.freeable[mm_hash] = 1
+            self.num_freeable_slots += 1
 
     def free(self, request: Request) -> None:
         """Free all encoder input cache reference held by *request*.
