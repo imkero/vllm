@@ -251,8 +251,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         else:
             self.max_encoder_len = 0
 
-        self.encoder_cache_tail_size = getattr(
-            scheduler_config, "encoder_cache_tail_size", None)
+        self.encoder_cache_tail_size = self.cache_config.block_size
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
@@ -1601,24 +1600,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # Cache the encoder outputs by mm_hash
         for (mm_hash, pos_info), output in zip(mm_hashes_pos, encoder_outputs):
-            total_tokens = output.shape[0]
-            tail_size = self.encoder_cache_tail_size
-            if tail_size is None or tail_size <= 0:
-                tail_start = 0
-            else:
-                tail_len = min(total_tokens, tail_size)
-                tail_start = max(total_tokens - tail_len, 0)
-
-            if tail_start > 0:
-                output = output[tail_start:]
-
-            is_embed = pos_info.is_embed
-            if is_embed is not None:
-                is_embed = is_embed[tail_start:tail_start + output.shape[0]]
-
             self.encoder_cache[mm_hash] = scatter_mm_placeholders(
                 output,
-                is_embed=is_embed,
+                is_embed=pos_info.is_embed,
             )
 
     def _gather_mm_embeddings(
@@ -1665,28 +1649,28 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 assert encoder_output is not None,\
                     f"Encoder cache miss for {mm_hash}."
 
-                tail_length = encoder_output.shape[0]
-                tail_start = max(num_encoder_tokens - tail_length, 0)
+                stored_length = encoder_output.shape[0]
+                stored_start = max(num_encoder_tokens - stored_length, 0)
                 if start_idx < tail_start:
                     raise RuntimeError(
                         "Encoder cache does not contain the required "
                         "prefix for multimodal input "
                         f"{mm_hash}: requested start {start_idx}, "
-                        f"available tail starts at {tail_start}.")
+                        f"available tail starts at {stored_start}.")
 
-                stored_start = start_idx - tail_start
-                stored_end = end_idx - tail_start
-                if stored_end > tail_length:
+                picked_start = start_idx - stored_start
+                picked_end = end_idx - stored_start
+                if picked_end > stored_length:
                     raise RuntimeError(
                         "Encoder cache slice exceeds cached tail for "
                         f"multimodal input {mm_hash}: requested end "
                         f"{end_idx}, available length {tail_length}.")
 
                 if (is_embed := pos_info.is_embed) is not None:
-                    is_embed = is_embed[start_idx:end_idx]
+                    is_embed = is_embed[picked_start:picked_end]
 
                 mm_embeds_item = gather_mm_placeholders(
-                    encoder_output[stored_start:stored_end],
+                    encoder_output[picked_start:picked_end],
                     is_embed=is_embed,
                 )
                 mm_embeds_req.append(mm_embeds_item)
@@ -1712,6 +1696,23 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 scheduler_output.total_num_scheduled_tokens)
 
         return mm_embeds
+
+    def _trim_mm_embeddings(self):
+        tail_size = self.encoder_cache_tail_size
+
+        for mm_hash, output in self.encoder_cache.items():
+            total_tokens = output.shape[0]
+
+            if total_tokens <= tail_size:
+                continue
+
+            tail_len = min(total_tokens, tail_size)
+            tail_start = max(total_tokens - tail_len, 0)
+
+            if tail_start > 0:
+                output_tail = output[tail_start:].copy()
+                self.encoder_cache[mm_hash] = output_tail
+                del output
 
     def _extract_encoder_inputs(
         self,
@@ -2006,6 +2007,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Run the multimodal encoder if any.
             self._execute_mm_encoder(scheduler_output)
             mm_embeds = self._gather_mm_embeddings(scheduler_output)
+
+            # Trim to save only the tail
+            self._trim_mm_embeddings()
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)

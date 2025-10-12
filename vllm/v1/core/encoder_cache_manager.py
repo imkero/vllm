@@ -66,15 +66,10 @@ class EncoderCacheManager:
     """
 
     def __init__(self,
-                 cache_size: int,
-                 *,
-                 tail_size: Optional[int] = None,
-                 max_items: Optional[int] = None):
-        self.cache_size = cache_size
-        self.encoder_cache_tail_size = (
-            cache_size if tail_size is None else max(tail_size, 0))
-        self.encoder_cache_max_item = (
-            cache_size if max_items is None else max(max_items, 0))
+                 tail_size: int,
+                 max_items: int):
+        self.encoder_cache_tail_size = tail_size
+        self.encoder_cache_max_item = max_items
         self.num_free_slots = self.encoder_cache_max_item
         self.num_freeable_slots = self.encoder_cache_max_item
 
@@ -94,15 +89,13 @@ class EncoderCacheManager:
 
         start, end = needed_range
         if start >= end:
-            return False
+            return True
 
         num_tokens = request.get_num_encoder_tokens(input_id)
         if num_tokens == 0:
             return True
 
         tail_len = min(num_tokens, self.encoder_cache_tail_size)
-        if tail_len == 0:
-            return False
         tail_start = max(num_tokens - tail_len, 0)
         return start >= tail_start
 

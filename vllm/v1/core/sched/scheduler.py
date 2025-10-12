@@ -152,14 +152,10 @@ class Scheduler(SchedulerInterface):
         # NOTE: For the models without encoder (e.g., text-only models),
         # the encoder cache will not be initialized because cache size is 0
         # for these models.
-        encoder_cache_tail_size = getattr(
-            self.scheduler_config, "encoder_cache_tail_size", None)
-        encoder_cache_max_item = getattr(
-            self.scheduler_config, "encoder_cache_max_item", None)
+        encoder_cache_max_items = int(os.environ.get("VLLM_ENCODER_CACHE_MAX_ITEMS", "128"))
         self.encoder_cache_manager = EncoderCacheManager(
-            cache_size=encoder_cache_size,
-            tail_size=encoder_cache_tail_size,
-            max_items=encoder_cache_max_item)
+            tail_size=self.block_size,
+            max_items=encoder_cache_max_items)
 
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
