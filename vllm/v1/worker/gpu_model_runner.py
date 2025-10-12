@@ -1651,7 +1651,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
                 stored_length = encoder_output.shape[0]
                 stored_start = max(num_encoder_tokens - stored_length, 0)
-                if start_idx < tail_start:
+                if start_idx < stored_start:
                     raise RuntimeError(
                         "Encoder cache does not contain the required "
                         "prefix for multimodal input "
